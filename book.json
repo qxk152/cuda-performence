@@ -1,0 +1,10 @@
+{
+  "title": "CUDA 性能调优实战指南",
+  "description": "从零到独立调优 AI Kernel 的系统学习路径",
+  "language": "zh",
+  "plugins": [],
+  "structure": {
+    "readme": "README.md",
+    "summary": "SUMMARY.md"
+  }
+}
