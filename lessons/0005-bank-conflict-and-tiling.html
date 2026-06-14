@@ -107,7 +107,46 @@ N 路冲突 → 慢 N 倍。<mark>注意:全员访问同一地址是"广播",不
 <code>Shared Memory Bank Conflicts</code> 的数量。非零就说明有冲突,可优化。
 </blockquote>
 
-<h2>3. 回到全局内存:二维按行 vs 按列,差在哪</h2>
+<h2>3. 冲突看 bank,不看读写:一次把地址算给你看</h2>
+
+<p>一个常见误解:以为 bank conflict 只发生在"读"。其实<strong>读(load)和写(store)完全对称</strong>——
+判定规则只有一条:<mark>同一个 warp 内,多个线程访问<em>不同地址但同一个 bank</em>,就被串行化</mark>,
+跟这条指令是读是写无关。把上一节的按列<em>读</em>改成按列<em>写</em>,一样 32 路冲突。</p>
+
+<p>为什么不存在"一边读一边写撞车"?因为 warp 是 <strong>SIMT</strong>:32 个线程同一拍执行的是<strong>同一条指令</strong>,
+要么全在读、要么全在写,不可能半读半写。所以你只需要对每一条 shared 指令单独看它的 32 个地址落在哪些 bank。</p>
+
+<p>把数算清楚。回顾映射 <code>bank = (地址字下标) % 32</code>。看一个 16 路冲突的例子:</p>
+
+<pre><code><span class="kw">__shared__</span> <span class="kw">float</span> s[<span class="num">512</span>];
+<span class="kw">int</span> t = threadIdx.x;          <span class="cm">// 一个 warp: t = 0..31</span>
+<span class="kw">float</span> v = s[t * <span class="num">2</span>];           <span class="hi">// 跨步 2 访问 → 2 路 bank conflict</span></code></pre>
+
+<p>逐线程列出字下标和它落的 bank(<code>bank = (t*2) % 32</code>):</p>
+
+<table>
+<tr><th>线程 t</th><th>字下标 t*2</th><th>bank=(t*2)%32</th></tr>
+<tr><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>1</td><td>2</td><td>2</td></tr>
+<tr><td>15</td><td>30</td><td>30</td></tr>
+<tr><td><strong>16</strong></td><td>32</td><td><strong>0</strong> ← 和 t=0 撞</td></tr>
+<tr><td><strong>17</strong></td><td>34</td><td><strong>2</strong> ← 和 t=1 撞</td></tr>
+<tr><td>31</td><td>62</td><td>30 ← 和 t=15 撞</td></tr>
+</table>
+
+<p>32 个线程只用到了 16 个偶数 bank(0,2,…,30),每个 bank 被 <strong>2 个线程</strong>抢(t 与 t+16),
+且它们要的是<strong>不同字</strong>(下标差 32)→ 硬件只能分 <strong>2 拍</strong>串行送 → <strong>2 路 bank conflict,慢 2 倍</strong>。
+把跨步从 2 改成 32(<code>s[t*32]</code>)就是 32 个线程全落 bank 0 的不同字 → 32 路、慢 32 倍。<mark>跨步与 32 的最大公约数越大,冲突越重。</mark></p>
+
+<div class="keypt">
+<strong>同地址是特例,这里读和写才分道扬镳:</strong>
+<br>• 32 线程读<strong>同一个字</strong> → <strong>broadcast</strong>(硬件多播),1 拍,免费——不是冲突。
+<br>• 32 线程写<strong>同一个字</strong> → 不是冲突、也无性能惩罚,但<strong>只有一个线程的值生效(哪个未定义)</strong>,
+这是<em>数据竞争</em>(正确性 bug),不属于性能话题。
+<br>关键区别:<mark>冲突 = 同 bank 的<strong>不同</strong>字;广播 = <strong>同一个</strong>字。</mark>读、写都按这条规则判。
+</div>
+
+<h2>4. 回到全局内存:二维按行 vs 按列,差在哪</h2>
 
 <p>上面的 bank 是 <strong>shared memory</strong> 内部的事。但<strong>为什么非要先把数据搬进 shared</strong>?
 根子在全局内存的<a href="0003-memory-coalescing.html">合并访问</a>:一个 warp 的 32 个线程<strong>同一拍一起发访存请求</strong>,
@@ -153,7 +192,7 @@ shared 不怕 stride,只怕 bank conflict(上面第 1-2 节)。这就把整条�
   <span class="cm">coalesced load</span>        <span class="cm">on-chip</span>      <span class="cm">不怕 stride,提防 bank conflict</span></code></pre>
 </div>
 
-<h2>4. 实战:矩阵乘从"慢"到"快"</h2>
+<h2>5. 实战:矩阵乘从"慢"到"快"</h2>
 
 <p>现在把整条链拧到一起。计算 <code>C = A × B</code>(都是 N×N)。</p>
 
@@ -183,7 +222,7 @@ C[...] = sum;</code></pre>
 <p>每块数据<strong>从全局加载 1 次,被整个 block 复用 T 次</strong>,全局访存量降为约 1/T。
 算术强度抬高 → roofline 上<mark>右移</mark> → 从访存瓶颈走向计算瓶颈,可逼近峰值算力。<span class="cite">[2]</span></p>
 
-<h2>5. 五节课在这一个 kernel 里全部现身</h2>
+<h2>6. 五节课在这一个 kernel 里全部现身</h2>
 
 <table>
 <tr><th>学过的概念</th><th>在 tiled GEMM 里的角色</th></tr>
@@ -200,7 +239,7 @@ C[...] = sum;</code></pre>
 <mark>你已经掌握了这条完整链路。</mark>
 </div>
 
-<h2>6. 练习:综合判断(混合前几节)</h2>
+<h2>7. 练习:综合判断(混合前几节)</h2>
 <p>本练习<strong>交错</strong>了前几节的概念——这正是检验你是否真懂的方式。点选项看反馈。</p>
 <div id="quiz"></div>
 

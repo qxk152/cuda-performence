@@ -30,12 +30,19 @@
 ## 待确认
 - 已确认 GPU:A100(sm_80) + **3060 Laptop GPU 6GB(sm_86)**,均可交互式跑命令。
 - 3060 工具链已全确认:`nvcc` 11.7 + `ncu` 2022.2 均在。
-- 若 3060 在 **WSL** 下(主机名 LAPTOP-…):`ncu` 硬件性能计数器支持有限,部分 metric(内存 SOL / roofline 图)
-  可能采不到;全量 profile 优先用 A100(疑似原生 Linux)。**待第 7 节实测时验证 ncu 在该机能否采到内存 metric**。
+- 若 3060 在 **WSL** 下(主机名 LAPTOP-…):`ncu` 硬件性能计数器**完全不可用**——
+  实测(2026-06-14,lesson8 reduce.cu)报错 `Profiling is not supported on device 0 as it uses the
+  Windows Subsystem for Linux (WSL)`,且 "No kernels were profiled"。**结论:WSL 下 ncu 内核级 profiling 一律采不到**,
+  3060 上的验证改用 **CUDA event 计时 + 手算等效带宽**;全量 ncu profile 留给 A100(原生 Linux)。
 - 笔记本 3060 实际 TGP 未知 → 峰值算力第 7 节用微基准实测确定。
 
 ## 工作笔记
 - 已建立 mission、resources、notes。第 1–6 节已完成(纸面框架:roofline→读报告→合并/对齐→shared/bank→occupancy)。
 - **环境升级(2025-06-13)**:从「本地无工具链、纸面学」→「双卡均可交互式跑命令,真机实操」。
   - `ncu` 在 3060 上已确认可用(2022.2)。消费卡跑 ncu 常需 **sudo 或开 perf counter 权限**,若报权限错有解法。
-- 下一节:**第 7 节·双卡 Roofline 实操**——把 roofline 钉到用户自己两块卡上,理解脊点右移→瓶颈翻转。
+  - **更正(2026-06-14)**:3060 在 WSL 下,ncu 内核 profiling 实测**完全不可用**(见上"待确认"已落实)。3060 验证靠 event 计时 + 手算带宽。
+- 第 8 节(reduction)已实操:`code/0008-reduce.cu` 三版对照(textbook / naive / optim),3060 sm_86 实测
+  优化版 ~309 GB/s ≈ 峰值 92%;naive/optim 打平(带宽墙),book 慢 3.34x(暴露 grid-stride 才是大头)。
+- 第 9 节(softmax/LayerNorm 融合)讲义已出:`lessons/0009-softmax-layernorm-fusion.html`。
+  主线=减少 HBM 往返(未融合 6N → 融合 2N),online softmax + warp shuffle 归约二元组,串到 FlashAttention。
+- 下一节:attention 全链 / FlashAttention 分块思想(本节融合 softmax 是其核心积木)。
