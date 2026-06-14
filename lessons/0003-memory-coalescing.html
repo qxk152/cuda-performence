@@ -39,9 +39,18 @@
   .cell{display:inline-block; width:1.7rem; text-align:center; border:1px solid var(--rule); margin:1px;}
   .t0{background:#d8ecd8;} .t1{background:#cfe3f5;} .t2{background:#f7e0c0;} .t3{background:#f3d0d0;}
   .miss{background:#eee; color:#aaa;}
+
+  .nav-home{display:inline-flex; align-items:center; gap:.3rem; color:var(--accent);
+    font-size:.9rem; font-weight:500; text-decoration:none; border:none;
+    margin-bottom:1.5rem; padding:.3rem 0; transition:opacity .15s;}
+  .nav-home:hover{opacity:.7;}
+  .nav-home::before{content:'← ';}
+
 </style>
 </head>
 <body>
+
+<a class="nav-home" href="../index.html">返回首页</a>
 
 <h1>访存合并:带宽的开关</h1>
 <p class="sub">Lesson 03 · CUDA 性能调优 · 访存瓶颈的头号武器</p>
