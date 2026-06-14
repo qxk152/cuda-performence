@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 06 · Occupancy 与 Launch 配置:藏住延迟</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.78rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Occupancy 与 Launch 配置:藏住延迟</h1>
+<p class="sub">Lesson 06 · CUDA 性能调优 · 回收"延迟瓶颈"</p>
+
+<p class="lead">前五节把<a href="0001-roofline-mental-model.html">访存优化</a>讲透了。但还记得
+<a href="0002-reading-speed-of-light.html">第 2 节</a>那个最易看漏的诊断吗——<mark>访存和计算利用率<strong>两个都低</strong></mark>?
+那通常不是访存或计算的问题,而是<strong>并行度不够、延迟没被藏住</strong>。这一节回收它,讲 GPU 怎么靠 <strong>occupancy</strong> 把延迟藏起来。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能解释 occupancy 是什么、它如何藏延迟、
+受哪三种资源限制,并理解一条反直觉的铁律——<strong>occupancy 不是越高越好</strong>。
+</div>
+
+<h2>1. GPU 藏延迟的方式:换 warp,不是等</h2>
+
+<p>访问全局内存要 ~400-800 周期(<a href="0004-shared-memory.html">第 4 节</a>的金字塔)。
+CPU 遇到这种停顿会用乱序执行、大缓存硬扛。GPU 的哲学完全不同:<mark>不等,直接切到另一个 warp 干活。</mark><span class="cite">[1]</span></p>
+
+<blockquote>
+一个 warp 因为等内存停住(stall),调度器立刻挑另一个<strong>就绪的 warp</strong> 发射指令。
+只要随时有就绪的 warp,SM 就一直在干活,内存延迟被"藏"在了其他 warp 的计算后面。
+</blockquote>
+
+<p>所以藏延迟的前提是:<strong>SM 上得有足够多的 warp 可供切换</strong>。warp 太少,大家都在等内存、没人能补上,
+SM 就空转——这正是<a href="0002-reading-speed-of-light.html">延迟瓶颈</a>:两个利用率都低。</p>
+
+<h2>2. Occupancy 的定义</h2>
+
+<div class="keypt">
+<strong>Occupancy = 每个 SM 上活跃 warp 数 ÷ 该 SM 能容纳的最大 warp 数</strong><span class="cite">[1]</span><br>
+就是"这个 SM 的并行席位坐满了几成"。A100 每 SM 最多 <strong>64 个 warp</strong>(= 2048 线程)。
+</div>
+
+<p>它衡量的是<strong>调度器有多少候选 warp 可切换</strong>。occupancy 越高,可切换的 warp 越多,越能藏住延迟。
+但"坐满席位"靠的是资源——而资源是有限的。</p>
+
+<h2>3. 限制 occupancy 的三种资源</h2>
+
+<p>一个 SM 的资源是固定的,三种资源各自会成为"先用完的那个",从而卡住 occupancy:<span class="cite">[1]</span></p>
+
+<table>
+<tr><th>资源</th><th>怎么卡住 occupancy</th><th>Nsight 字段</th></tr>
+<tr><td><strong>寄存器/线程</strong></td><td>每线程用太多寄存器 → SM 寄存器池装不下那么多线程</td><td>limit due to registers</td></tr>
+<tr><td><strong>shared memory/block</strong></td><td>每 block 用太多 shared → 同时驻留的 block 变少</td><td>limit due to shared mem</td></tr>
+<tr><td><strong>block 大小</strong></td><td>block 太小 → 撞上"每 SM 最多 N 个 block"的上限,warp 席位坐不满</td><td>limit due to block size</td></tr>
+</table>
+
+<p>典型场景:你的 kernel 每线程要 <strong>64 个寄存器</strong>,而 SM 寄存器池只够 1024 个线程同时用 64 个——
+那 occupancy 就被锁在 50%(1024/2048),与 block 怎么配无关。<mark>这是"寄存器压力"限制 occupancy。</mark></p>
+
+<h2>4. 反直觉铁律:不是越高越好</h2>
+
+<p>新手最大的误区是把 occupancy 当成"分数",拼命冲 100%。<strong>官方明确说:occupancy 高不一定快。</strong><span class="cite">[1]</span></p>
+
+<p>原因有二:</p>
+<ul>
+<li><strong>延迟也能靠 ILP 藏。</strong> 哪怕 warp 不多,只要每个 warp 内有<strong>互相独立的指令</strong>(指令级并行),
+调度器在等内存时也能发射同一 warp 的后续独立指令。低 occupancy + 高 ILP 照样能跑满。</li>
+<li><strong>提高 occupancy 常常要付代价。</strong> 比如减少每线程寄存器来塞更多 warp,
+可能逼编译器把变量溢出到内存(register spilling),反而更慢。</li>
+</ul>
+
+<div class="keypt">
+<strong>正确心态:</strong> occupancy 是<em>藏延迟的手段之一</em>,不是目标。
+<mark>只在"延迟瓶颈 + occupancy 偏低"时才去提它</mark>;
+若已经能藏住延迟(利用率高),再堆 occupancy 没有意义。先测量,再决定。
+</div>
+
+<p>但有一条是确定的:<strong>occupancy 过低一定伤性能</strong>——候选 warp 太少,延迟藏不住。<span class="cite">[1]</span>
+所以它是个"下限要保证、上限别强求"的指标。</p>
+
+<h2>5. Launch 配置的实用建议</h2>
+
+<p>kernel 启动时你要定 <code>&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;</code>。落地经验:</p>
+
+<table>
+<tr><th>选择</th><th>建议</th></tr>
+<tr><td>block 大小</td><td>取 <strong>32 的倍数</strong>(warp 对齐),常用 128 / 256;别太小(撞 block 数上限)</td></tr>
+<tr><td>grid 大小</td><td>足够多 block 覆盖全部数据,且 ≥ SM 数量,让每个 SM 都有活干</td></tr>
+<tr><td>不确定时</td><td>用 <code>cudaOccupancyMaxPotentialBlockSize()</code> 让运行时<strong>推荐</strong>一个 block 大小<span class="cite">[1]</span></td></tr>
+</table>
+
+<pre><code><span class="cm">// 让 CUDA 替你算出能最大化 occupancy 的 block 大小</span>
+<span class="kw">int</span> minGrid, blockSize;
+<span class="fn">cudaOccupancyMaxPotentialBlockSize</span>(&minGrid, &blockSize, myKernel, <span class="num">0</span>, <span class="num">0</span>);
+<span class="cm">// 再据此算 grid:覆盖 n 个元素</span>
+<span class="kw">int</span> grid = (n + blockSize - <span class="num">1</span>) / blockSize;
+<span class="fn">myKernel</span><<<grid, blockSize>>>(...);</code></pre>
+
+<blockquote>
+Nsight Compute 的 Occupancy 段会同时给你<strong>理论 occupancy</strong>(资源算出的上限)和
+<strong>实测 achieved occupancy</strong>。两者差距大,通常是负载不均(尾部效应、block 数不够)。<span class="cite">[1]</span>
+</blockquote>
+
+<h2>6. 练习:综合判断</h2>
+<p>混合了 occupancy 与前几节的诊断。点选项看反馈。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> 寄存器数怎么查(<code>-Xptxas -v</code>)?ILP 具体怎么写?
+理论 vs 实测 occupancy 差很多怎么办?什么是尾部效应(tail effect)?我是你的老师,尽管问。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy">CUDA C++ Best Practices Guide — Occupancy</a>
+——讲清 occupancy 定义、计算与"不是越高越好"。配合 Nsight Compute 的 Occupancy 段实践。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy">NVIDIA, CUDA C++ Best Practices Guide — Occupancy</a> ·
+<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html">Nsight Compute Profiling Guide — Occupancy</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0005-bank-conflict-and-tiling.html">Lesson 05 · Bank Conflict & Tiling</a> ·
+延迟瓶颈出处 → <a href="0002-reading-speed-of-light.html">Lesson 02</a> ·
+内存金字塔 → <a href="0004-shared-memory.html">Lesson 04</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:跨 6 节的<strong>间隔复习测验</strong>——把短期"流畅"转成长期"留存"。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"报告:Memory 15%,Compute 12%,Occupancy 13%。最该做什么?",
+  a:["立刻去优化访存合并","立刻去换更快指令","提高并行度藏住延迟","判定已达硬件极限"],c:2,
+  e:"两项都低+occupancy 极低 → 延迟瓶颈。warp 太少藏不住延迟,应提高 occupancy 或 ILP。"},
+ {q:"关于 occupancy,下面哪种说法是正确的?",
+  a:["越高就一定会越快","过低一定损害性能","跟延迟没什么关系","只由block大小决定"],c:1,
+  e:"高不一定快(ILP 也能藏延迟,提它有代价);但过低一定伤性能(候选 warp 不足)。"},
+ {q:"kernel 每线程用 64 寄存器,occupancy 卡在 50%。最可能的限制资源是?",
+  a:["共享内存太多占用","寄存器压力的限制","block设得过大所致","全局访存没有合并"],c:1,
+  e:"寄存器/线程过高 → SM 寄存器池装不下更多线程 → occupancy 受寄存器限制。可减寄存器或权衡。"},
+ {q:"一个已是计算瓶颈、利用率很高的 kernel,再强行提高 occupancy:",
+  a:["一定带来大幅加速","未必有益可能更糟","必然消除计算瓶颈","会自动降低寄存器"],c:1,
+  e:"延迟已藏住,堆 occupancy 无益;若靠减寄存器换取还可能引发 spilling 反而更慢。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——occupancy 是藏延迟的手段,有下限、无需冲顶;先看瓶颈类型。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

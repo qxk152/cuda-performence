@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 08 · Reduction 优化(单卡 A100)</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.76rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;} pre .ty{color:#4ec9b0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Reduction 优化(单卡 A100)</h1>
+<p class="sub">Lesson 08 · CUDA 性能调优 · 第一个访存瓶颈算子的极限压榨</p>
+
+<p class="lead">上一节把 roofline 钉到了真卡上。这一节换一种瓶颈:<a href="0005-bank-conflict-and-tiling.html">tiled GEMM</a> 是<strong>计算瓶颈</strong>,
+而 <strong>reduction(归约)</strong>——把一个大数组加成一个标量——是教科书级的<strong>访存瓶颈</strong>算子。
+它在 AI 里无处不在:softmax 的分母、LayerNorm 的均值/方差、loss、梯度范数,本质都是 reduction。
+本节<mark>只针对 A100(sm_80)</mark>,把它从朴素版一路优化到逼近 HBM 带宽极限。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能说清"reduction 的天花板是带宽不是算力",
+并掌握三级优化——<strong>块内 sequential addressing → warp shuffle → grid-stride 多元素</strong>,
+最后用 <code>ncu</code> 的 DRAM Throughput 验证你吃到了 A100 ~1.5–2.0 TB/s 的几成。
+</div>
+
+<h2>1. 先定瓶颈:reduction 注定是访存瓶颈</h2>
+
+<p>把 N 个 float 加成 1 个标量。<strong>读</strong> N×4 字节,<strong>算</strong> N−1 次加法。算术强度:</p>
+
+<pre><code>算术强度 = FLOPs / Bytes ≈ (N-1) / (4N) ≈ <span class="hi">0.25 FLOP/Byte</span></code></pre>
+
+<p>A100 的<a href="0001-roofline-mental-model.html">脊点</a>约 <strong>12.6 FLOP/Byte</strong>。0.25 远远在脊点<strong>左侧</strong> →
+<mark>铁定的访存瓶颈</mark>。这立刻给了你一条铁律:</p>
+
+<div class="keypt">
+<strong>reduction 优化的唯一目标 = 把 HBM 带宽吃满。</strong> 不要去想"减少加法次数"(算力根本没用满),
+要想的是"<em>每个字节只从显存读一次,且读得完全合并</em>"。理论下限就是<strong>把整个数组完整读一遍的时间</strong>:
+<code>N×4 / 带宽</code>。比如 N=2²⁸(1 GB),A100 ~1.8 TB/s → 下限约 <strong>0.55 ms</strong>。你的 kernel 离它多远,就是优化空间。
+</div>
+
+<h2>2. 朴素版:interleaved addressing(慢在哪)</h2>
+
+<p>经典写法:block 内每个线程搬一个元素进 shared,然后"树形"两两相加。第一版用<strong>交错寻址</strong>:</p>
+
+<pre><code><span class="kw">__shared__</span> <span class="kw">float</span> sdata[BLOCK];
+<span class="kw">int</span> tid = threadIdx.x;
+sdata[tid] = g_in[blockIdx.x*BLOCK + tid];   <span class="cm">// 合并加载 ✅</span>
+<span class="fn">__syncthreads</span>();
+
+<span class="kw">for</span> (<span class="kw">int</span> s = <span class="num">1</span>; s < BLOCK; s *= <span class="num">2</span>) {
+    <span class="kw">if</span> (tid % (<span class="num">2</span>*s) == <span class="num">0</span>)              <span class="hi">// ❌ 取模 → warp 内严重分支发散</span>
+        sdata[tid] += sdata[tid + s];
+    <span class="fn">__syncthreads</span>();
+}
+<span class="kw">if</span> (tid == <span class="num">0</span>) g_out[blockIdx.x] = sdata[<span class="num">0</span>];</code></pre>
+
+<p>两个病:<strong>(1) <code>tid % (2*s)</code> 让一个 warp 里只有零星线程干活</strong>,其余空转却仍占用调度——
+这正是<a href="0006-occupancy-and-launch-config.html">第 6 节</a>说的 warp 分支发散。
+<strong>(2) <code>sdata[tid+s]</code> 这种跨步访问,在 shared 里会撞 <a href="0005-bank-conflict-and-tiling.html">bank conflict</a></strong>。</p>
+
+<h2>3. 第一刀:sequential addressing(干掉发散与 bank conflict)</h2>
+
+<p>把循环反过来——<strong>从大步长往小走,让活跃线程永远是前一半连续的 tid</strong>:</p>
+
+<pre><code><span class="kw">for</span> (<span class="kw">int</span> s = BLOCK/<span class="num">2</span>; s > <span class="num">0</span>; s >>= <span class="num">1</span>) {
+    <span class="kw">if</span> (tid < s)                          <span class="hi">// ✅ 活跃线程是连续的 0..s-1</span>
+        sdata[tid] += sdata[tid + s];
+    <span class="fn">__syncthreads</span>();
+}</code></pre>
+
+<p>同一个 warp 的 32 个线程要么全活跃、要么全休眠 → <strong>无分支发散</strong>。
+而且 <code>sdata[tid]</code> 与 <code>sdata[tid+s]</code> 都是连续地址 → <strong>无 bank conflict</strong>。<span class="cite">[1]</span></p>
+
+<div class="keypt">
+<strong>同一行代码,只是循环方向反了,就同时治好两个病。</strong> 这是 reduction 优化里最经典的一步,
+也是"<mark>让一个 warp 内线程行为一致</mark>"这条通用直觉的最佳示范。
+</div>
+
+<h2>4. 第二刀:warp shuffle —— 最后 32 个线程不走 shared</h2>
+
+<p>注意上面循环走到 <code>s ≤ 32</code> 时,只剩<strong>一个 warp</strong> 在干活。这时还在用 <code>__syncthreads()</code>
+和 shared memory,纯属浪费——<mark>同一 warp 内的线程本就是锁步执行的,可以直接交换寄存器</mark>。
+A100 上用 <code>__shfl_down_sync</code>:</p>
+
+<pre><code><span class="cm">// 当 s 降到 32:不再回写 shared,改用 warp 内寄存器洗牌</span>
+<span class="kw">float</span> v = sdata[tid];
+<span class="kw">for</span> (<span class="kw">int</span> off = <span class="num">16</span>; off > <span class="num">0</span>; off >>= <span class="num">1</span>)
+    v += <span class="fn">__shfl_down_sync</span>(<span class="num">0xffffffff</span>, v, off);   <span class="hi">// 寄存器→寄存器,零 shared、零 sync</span>
+<span class="kw">if</span> (tid == <span class="num">0</span>) g_out[blockIdx.x] = v;</code></pre>
+
+<p><code>__shfl_down_sync(mask, v, off)</code>:让 lane <code>tid</code> 直接读到 lane <code>tid+off</code> 寄存器里的 <code>v</code>,
+全程不碰 shared memory,也不需要 <code>__syncthreads()</code>。<span class="cite">[2]</span> 最后一个 warp 的 5 步全在寄存器里完成。</p>
+
+<div class="keypt">
+<strong>warp shuffle 是现代 reduction 的标配。</strong> 它省掉了最后 log₂(32)=5 轮的 shared 往返与同步。
+更进一步:整块归约都可以写成<em>"每个 warp 先 shuffle 出 32 个部分和 → 写进一小块 shared → 第一个 warp 再 shuffle 一次"</em>,
+shared 只用 <code>BLOCK/32</code> 个槽,几乎无 bank conflict。<code>__reduce_add_sync</code>(sm_80 原生指令)还能把整 warp 求和压成一条指令。
+</div>
+
+<h2>5. 第三刀:grid-stride —— 一个线程先吞多个元素(最关键)</h2>
+
+<p>前面每个线程只读 1 个元素。但<strong>启动 block、加载、做 log₂ 轮归约</strong>这些<em>开销</em>是固定的,
+摊在 1 个元素上太亏。真正的提速来自<mark>让每个线程在进 shared 之前,先用一个 grid-stride 循环把 N/总线程数 个元素加起来</mark>:</p>
+
+<pre><code><span class="kw">int</span> i = blockIdx.x*BLOCK + tid;
+<span class="kw">int</span> stride = gridDim.x * BLOCK;          <span class="cm">// 整个 grid 的线程数</span>
+<span class="kw">float</span> sum = <span class="num">0</span>;
+<span class="kw">while</span> (i < N) {                          <span class="hi">// 每次跳一整个 grid → 始终合并访问</span>
+    sum += g_in[i];
+    i += stride;
+}
+sdata[tid] = sum;                         <span class="cm">// 进 shared 时已经是局部和</span>
+<span class="fn">__syncthreads</span>();
+<span class="cm">// …接第 3、4 节的块内归约…</span></code></pre>
+
+<p>为什么是 grid-stride 而不是"每个线程连读一段连续区间"?因为<strong>同一拍里 warp 的 32 个线程地址必须相邻才<a href="0003-memory-coalescing.html">合并</a></strong>。
+跳 <code>stride = gridDim.x*BLOCK</code> 保证每一轮 32 个线程读的是连续的 32 个 float。<span class="cite">[3]</span></p>
+
+<div class="keypt">
+<strong>这一刀决定成败。</strong> 它把"固定开销 / 元素"摊薄,同时让访存全程保持合并、规模随 N 自适应。
+<mark>block 数选 SM 数的若干倍(A100 有 108 个 SM,常取 几百~上千 个 block),</mark>每个线程吞几十~几百个元素,
+就能把 DRAM 带宽吃到 80–90%。这是从"能跑"到"接近极限"的关键。
+</div>
+
+<h2>6. 收尾:两个标量怎么变一个</h2>
+
+<p>每个 block 产出一个部分和,grid 有 <code>G</code> 个 block → 得到 <code>G</code> 个部分和。怎么合成最终一个标量?三种路子:</p>
+
+<table>
+<tr><th>做法</th><th>说明</th><th>何时用</th></tr>
+<tr><td><strong>两趟 kernel</strong></td><td>第一趟 N→G,第二趟 G→1(同一 kernel 再跑一次)</td><td>最稳,最常用,易调试</td></tr>
+<tr><td><strong>atomicAdd</strong></td><td>每个 block 算完 <code>atomicAdd(g_out, partial)</code></td><td>G 不大时;一趟搞定</td></tr>
+<tr><td><strong>cooperative groups 网格同步</strong></td><td><code>grid.sync()</code> 一个 kernel 内做完两级</td><td>进阶,需 launch 支持</td></tr>
+</table>
+
+<p>A100 上 grid-stride 已经把 G 压得很小(几百~上千),所以 <code>atomicAdd</code> 收尾或两趟 kernel 都很快,差别可忽略——
+<mark>瓶颈始终是第一趟那次"完整读一遍数组",收尾只是零头。</mark></p>
+
+<h2>7. 真机验证:用 ncu 看 DRAM Throughput</h2>
+
+<p>reduction 不看 Compute%,要盯<strong>内存吞吐</strong>。编译跑 profile(A100 用 <code>sm_80</code>):</p>
+
+<pre><code>nvcc -O3 -arch=sm_80 reduce.cu -o reduce
+ncu --set full --section MemoryWorkloadAnalysis ./reduce</code></pre>
+
+<p>三个关键读数,按这个顺序判断:</p>
+
+<table>
+<tr><th>指标</th><th>看什么</th><th>健康值(A100)</th></tr>
+<tr><td><code>DRAM Throughput</code></td><td>占峰值带宽的百分比 = 你离极限多远</td><td>✅ 优化后应 ≥ 80%</td></tr>
+<tr><td><code>Memory Throughput</code> / SOL</td><td><a href="0002-reading-speed-of-light.html">Speed of Light</a> 里 Memory 那条</td><td>✅ 高且 Compute 低 = 对了</td></tr>
+<tr><td><code>Bank Conflicts</code></td><td>shared 内冲突数</td><td>✅ 应为 0(第 3 节已治)</td></tr>
+</table>
+
+<div class="keypt">
+<strong>验证逻辑闭环:</strong> 先算理论下限 <code>N×4/带宽</code> → 跑 kernel 测实际耗时 →
+<code>实测带宽 = 读字节/耗时</code> → 对比峰值。<mark>当 DRAM Throughput 上到 80%+ 且 Duration 逼近理论下限,这个访存瓶颈算子就算调到头了。</mark>
+再快不会来自 reduction 本身,而是融合(把 reduction 和上游算子合成一个 kernel,省掉中间结果的读写)。
+</div>
+
+<h2>8. 整条优化链回顾</h2>
+
+<table>
+<tr><th>阶段</th><th>动作</th><th>治的病 / 用的前节知识</th></tr>
+<tr><td>定位</td><td>算术强度 0.25 → 访存瓶颈</td><td>Roofline(L1)</td></tr>
+<tr><td>第一刀</td><td>sequential addressing</td><td>分支发散(L6)+ bank conflict(L5)</td></tr>
+<tr><td>第二刀</td><td>warp shuffle 收尾</td><td>省 shared 往返与 sync</td></tr>
+<tr><td>第三刀</td><td>grid-stride 多元素</td><td>合并访问(L3)+ 摊薄开销</td></tr>
+<tr><td>验证</td><td>ncu 看 DRAM Throughput ≥80%</td><td>读 SOL 报告(L2)</td></tr>
+</table>
+
+<h2>9. 练习:reduction 决策(混合前几节)</h2>
+<p>点选项看反馈。这些题交错了 roofline、合并、bank conflict、occupancy——这正是检验你是否真懂的方式。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> 想看一份完整可编译的 A100 reduction(含 grid-stride + warp shuffle + 收尾)?
+<code>__shfl_down_sync</code> 的 mask 为什么是 <code>0xffffffff</code>?block 大小到底选 256 还是 512?
+softmax/LayerNorm 里的 reduction 怎么和指数/归一化融合?把问题抛来。我是你的老师。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf">Mark Harris, "Optimizing Parallel Reduction in CUDA"(NVIDIA 经典 slide)</a>
+——逐版本演示 7 步优化(交错→顺序→首次加载即相加→展开→多元素),本节的骨架就来自它,只是把收尾换成现代的 warp shuffle 并落到 A100。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf">Mark Harris, NVIDIA — Optimizing Parallel Reduction in CUDA</a><br>
+[2] <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions">NVIDIA, CUDA C++ Programming Guide — Warp Shuffle Functions</a><br>
+[3] <a href="https://developer.nvidia.com/blog/cuda-pro-tip-write-flexible-kernels-grid-stride-loops/">NVIDIA Developer Blog — CUDA Pro Tip: Write Flexible Kernels with Grid-Stride Loops</a></p>
+<p><strong>本节关联</strong>:
+合并 → <a href="0003-memory-coalescing.html">Lesson 03</a> ·
+Shared/Bank → <a href="0005-bank-conflict-and-tiling.html">Lesson 05</a> ·
+Occupancy → <a href="0006-occupancy-and-launch-config.html">Lesson 06</a> ·
+Roofline → <a href="0001-roofline-mental-model.html">Lesson 01</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:Softmax / LayerNorm——把本节的 reduction 与逐元素算子<strong>融合</strong>成一个 kernel,
+省掉中间结果的显存往返,这才是 AI 算子真正的提速来源。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"N 个 float 求和,算术强度约 0.25 FLOP/Byte。A100 上它是:",
+  a:["计算瓶颈拉满算力","访存瓶颈看带宽","延迟瓶颈靠occupancy","已接近硬件极限"],c:1,
+  e:"0.25 远在 A100 脊点(≈12.6)左侧 → 铁定访存瓶颈。优化目标是吃满 HBM 带宽,不是减少加法。"},
+ {q:"朴素版用 tid % (2*s)==0 选活跃线程。主要病因:",
+  a:["bank广播太频繁","warp内严重分支发散","加载阶段未合并","occupancy过高了"],c:1,
+  e:"取模让一个 warp 里只有零星线程干活,其余空转 → 分支发散。改成 if(tid<s) 顺序寻址即可。"},
+ {q:"把循环改成 s=BLOCK/2 起、if(tid<s),同时治好了哪两个病?",
+  a:["发散和bank conflict","occupancy和延迟","合并和算力","寄存器和溢出"],c:0,
+  e:"活跃线程变连续 → 无发散;sdata[tid] 与 sdata[tid+s] 连续地址 → 无 bank conflict。一石二鸟。"},
+ {q:"当归约只剩最后一个 warp(s≤32),最佳做法:",
+  a:["继续用shared加sync","换成warp shuffle寄存器交换","加大block重新归约","用atomicAdd逐个加"],c:1,
+  e:"同一 warp 锁步执行,__shfl_down_sync 直接寄存器互换,省掉最后 5 轮 shared 往返与 __syncthreads。"},
+ {q:"grid-stride 让每个线程先吞多个元素,步长取 gridDim.x*BLOCK 的原因:",
+  a:["让warp每轮地址连续保持合并","减少寄存器使用量","避免bank conflict","提高occupancy上限"],c:0,
+  e:"跳一整个 grid 宽度,保证同一拍 warp 内 32 线程读的是连续 32 个 float → 全程合并访问。"},
+ {q:"优化后 ncu 显示 DRAM Throughput 88%、Compute 低。说明:",
+  a:["还有大量算力没用应继续","已逼近带宽极限调到头了","occupancy不足要加block","存在bank conflict待修"],c:1,
+  e:"访存瓶颈算子吃满带宽就是终点。再快只能靠融合(把 reduction 与上游算子合成一个 kernel)。"},
+ {q:"第一趟得到 G 个 block 部分和。A100 grid-stride 下 G 很小,收尾用 atomicAdd 还是两趟 kernel?",
+  a:["必须两趟否则错","只能atomicAdd","两者都行差别可忽略","得用cooperative grid"],c:2,
+  e:"瓶颈是第一趟完整读一遍数组,收尾只是零头。G 小的时候 atomicAdd 或两趟 kernel 性能几乎一样。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——reduction 是访存瓶颈;warp 内要行为一致;访存要合并。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 07 · 双卡 Roofline 实操:测你自己的天花板</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem;
+    font-size:19px; -webkit-font-smoothing:antialiased;
+  }
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:var(--code); padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.8rem; line-height:1.5; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent);
+    color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  figure{margin:2rem 0; text-align:center;}
+  figcaption{font-size:.8rem; color:var(--muted); font-style:italic; margin-top:.5rem;}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule);
+    font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0;
+    font-size:.92rem; border-left:3px solid #4a6b4a;}
+  .card{display:flex; gap:1rem; margin:1.2rem 0;}
+  .card>div{flex:1; background:#f7f5ec; border-radius:6px; padding:.8rem 1rem; font-size:.85rem;}
+  .card .a100{border-top:3px solid #2d5a7a;}
+  .card .l3060{border-top:3px solid #7a5a2d;}
+  .run{background:#f0ece0; border-left:3px solid var(--accent); border-radius:6px;
+    padding:.7rem 1.1rem; margin:1rem 0; font-size:.9rem;}
+  .run b{color:var(--accent);}
+</style>
+</head>
+<body>
+
+<h1>双卡 Roofline 实操:测你自己的天花板</h1>
+<p class="sub">Lesson 07 · CUDA 性能调优 · 把 roofline 钉到你的 A100 与 3060 上</p>
+
+<p class="lead">前六节你在纸面上建好了调优框架。现在你手上有<strong>两块能跑的卡</strong>——
+是时候把抽象的 roofline 钉到真实硬件上了。本节你将<mark>亲手测出自己两块卡的屋顶</mark>,
+并发现一件反直觉的事:<strong>同一个 kernel,在 A100 上是计算瓶颈,在 3060 上却变成访存瓶颈。</strong>
+这是消费卡和数据中心卡最值钱的一条直觉。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能用一条微基准命令<strong>实测出自己每块卡的真实带宽</strong>,
+算出各自的<strong>脊点</strong>,并据此判断:给定算术强度的 kernel,在哪块卡上撞哪堵墙。
+</div>
+
+<h2>1. 为什么不能直接抄规格表</h2>
+
+<p>第 1 节我们用了 A100 的「官方」数字。但真机调优有一条铁律:<mark>规格表是营销数字,不是你能达到的数字。</mark></p>
+
+<p>你的 3060 是 <strong>笔记本版(RTX 3060 Laptop GPU, 6GB)</strong>。它的 FP32 峰值<em>不是</em>固定值——
+笔记本厂商把功耗墙(TGP)配在 60W 到 130W 之间,<mark>同名的卡实际性能能差 20–30%</mark>。<span class="cite">[3]</span>
+你抄到的「12.7 TFLOP/s」可能根本不是你这台的数字。</p>
+
+<blockquote>
+推论:roofline 的两道屋顶,<strong>都该测,不该抄</strong>。带宽用微基准测,算力用峰值微基准测。
+规格表只用来对照「我测出来的离理论上限差多远」。
+</blockquote>
+
+<h2>2. 实测带宽:斜屋顶的真实斜率</h2>
+
+<p>访存屋顶的斜率<em>就是</em>显存带宽。CUDA 自带一个现成的微基准 <code>bandwidthTest</code>,
+它在显存里搬一大块数据,直接报告你能达到的 device-to-device 带宽。先在<strong>两块卡上都跑一遍</strong>。</p>
+
+<div class="run">
+<b>▶ 在两台机器分别运行(A100 与 3060):</b>
+<pre><code># CUDA 11.7 自带的编译好版本,路径通常在:
+/usr/local/cuda/extras/demo_suite/bandwidthTest --dtod
+
+# 若不在,从 cuda-samples 编译 bandwidthTest 后:
+./bandwidthTest --memory=pinned --mode=shmoo</code></pre>
+看 <code>Device to Device Bandwidth</code> 那一行——<mark>那才是 roofline 斜屋顶的真实斜率</mark>。
+忽略 H2D/D2H(那是 PCIe 带宽,不是显存带宽)。
+</div>
+
+<p>若找不到 <code>bandwidthTest</code>,用这个拷贝核自测(<code>c[i]=a[i]</code>:读 4B + 写 4B = 每元素搬 8 字节):</p>
+
+<pre><code>// bw.cu — 编译: nvcc -O3 -arch=sm_80 bw.cu -o bw   (3060 改 sm_86!)
+__global__ void copy(float* c, const float* a, size_t n){
+  size_t i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i &lt; n) c[i] = a[i];
+}
+// 主机端要点:N=64M floats(远大于 L2);用 cudaEvent 计时;
+// 带宽(GB/s) = 8*N(字节) / 时间(s) / 1e9 ;预热一次再正式测十次取中位数</code></pre>
+
+<div class="keypt">
+<strong>实测带宽的两个纪律:</strong><br>
+① <strong>预热</strong>:第一次 launch 含驱动/初始化开销,丢弃,取后续多次的中位数。<br>
+② <strong>够大</strong>:数据要远大于 L2(A100 的 L2 有 40MB),否则你测的是缓存带宽,不是显存带宽。<span class="cite">[1]</span>
+</div>
+
+<h2>3. 算脊点:两块卡的屋顶差在哪</h2>
+
+<p>把实测带宽填进脊点公式(回忆第 1 节):<strong>脊点 = 峰值算力 ÷ 带宽</strong>。下面是<em>规格表估值</em>,
+等你跑完微基准,用<strong>实测值</strong>替换——这才是你这两台机器的真屋顶。</p>
+
+<div class="card">
+<div class="a100"><strong>A100(sm_80)</strong><br>
+FP32 ≈ 19.5 TFLOP/s<br>
+带宽 ≈ 1.5–2.0 TB/s<br>
+<mark>脊点 ≈ 19.5 / 1.55 ≈ <strong>12.6</strong></mark> FLOP/Byte</div>
+<div class="l3060"><strong>3060 Laptop(sm_86)</strong><br>
+FP32 ≈ 10–13 TFLOP/s †<br>
+带宽 ≈ 336 GB/s<br>
+<mark>脊点 ≈ 11.6 / 0.336 ≈ <strong>34.5</strong></mark> FLOP/Byte</div>
+</div>
+<p style="font-size:.82rem;color:var(--muted)">† 笔记本 3060 算力随 TGP 浮动,务必实测替换。<span class="cite">[2][3]</span></p>
+
+<p>注意这个差异的<strong>方向</strong>:3060 的脊点(≈35)<mark>远在 A100(≈12.6)右边</mark>。
+原因不是 3060 算力强,而是它的<em>带宽相对算力太弱</em>:
+A100 的带宽是 3060 的 ~5 倍,算力只有 ~1.7 倍。脊点 = 算力/带宽,带宽掉得更狠,脊点就被推向右。</p>
+
+<h2>4. 瓶颈翻转:同一个 kernel,两种命运</h2>
+
+<p>本节核心洞察。设想一个算术强度 <strong>AI = 20</strong> 的 kernel(比如一个复用度中等的小 tile GEMM):</p>
+
+<table>
+<tr><th>卡</th><th>脊点</th><th>AI=20 落在哪</th><th>瓶颈</th><th>该往哪优化</th></tr>
+<tr><td>A100</td><td>12.6</td><td>20 &gt; 12.6,<strong>右侧</strong></td><td>计算瓶颈</td><td>提计算(tensor core、ILP)</td></tr>
+<tr><td>3060</td><td>34.5</td><td>20 &lt; 34.5,<strong>左侧</strong></td><td>访存瓶颈</td><td>提访存(合并、shared)</td></tr>
+</table>
+
+<div class="keypt">
+<strong>同一份代码,优化方向相反。</strong> 在 A100 上你该堆计算单元利用率;在 3060 上你该省显存访问。
+<mark>瓶颈不是 kernel 的固有属性,而是「kernel × 这块卡」的组合属性。</mark>
+所以调优前永远先确认:「在哪块卡、它的脊点多少」。
+</div>
+
+<p>这条直觉直接服务你的 mission:在 3060 上日常迭代会更早撞访存墙,逼你把访存优化(第 3–5 节)做扎实;
+搬到 A100 跑,同一 kernel 可能翻成计算瓶颈,这时第 6 节往后的计算侧优化才登场。
+<mark>两块卡正好覆盖 roofline 的两侧</mark>,是绝佳的双视角训练场。</p>
+
+<h2>5. 练习:双卡瓶颈判断(动手回忆)</h2>
+
+<p>不要看上文,凭记忆判断。<em>用本节脊点:A100=12.6,3060=34.5。</em></p>
+
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 卡住了就问我。</strong> <code>bandwidthTest</code> 找不到?ncu 在 WSL 报权限错?
+实测带宽只有理论的 70% 正常吗?算力峰值怎么单独测?随时追问,把不清楚的挖透。
+</div>
+
+<h2>主源推荐(本节精读 / 必看)</h2>
+<p>📘 <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide">Nsight Compute Profiling Guide — Roofline / Memory Workload</a>
+——本节把 roofline 落到真机,这份指南讲 ncu 如何<em>自动画出</em>你 kernel 在 roofline 上的点。
+读「GPU Speed of Light Roofline Chart」一节,正好对接你刚手算的脊点。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">NVIDIA, CUDA C++ Best Practices Guide</a><br>
+[2] <a href="https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html">NVIDIA, Ampere Tuning Guide</a><br>
+[3] <a href="https://www.techpowerup.com/gpu-specs/geforce-rtx-3060-mobile.c3757">TechPowerUp, RTX 3060 Mobile Specs</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0006-occupancy-and-launch-config.html">Occupancy 与 Launch 配置</a> ·
+参考卡 → <a href="../reference/roofline-cheatsheet.html">Roofline 速查表</a> ·
+任务 → <a href="../MISSION.md">Mission</a></p>
+<p><strong>下一节预告</strong>:Reduction——第一次在两块卡上真机「从慢到快」,naive → warp shuffle 四版,
+亲手计时、看加速比,并验证「3060 上访存瓶颈更严重」的预测。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"一个 kernel 算术强度=20。在你的 A100(脊点12.6)上,它是哪类瓶颈?",
+  a:["这是一个访存瓶颈的算子","这是一个计算瓶颈的算子","这两者它都不是瓶颈","需更多信息才可判断"],c:1,
+  e:"20 > 12.6,落在 A100 脊点右侧水平线下,计算瓶颈。该提计算效率(tensor core / ILP)。"},
+ {q:"同一个 AI=20 的 kernel,搬到 3060(脊点34.5)上,它是哪类瓶颈?",
+  a:["这是一个访存瓶颈的算子","这是一个计算瓶颈的算子","这两者它都不是瓶颈","需更多信息才可判断"],c:0,
+  e:"20 < 34.5,落在 3060 脊点左侧斜线下,访存瓶颈。瓶颈翻转了——这是本节核心。"},
+ {q:"3060 的脊点比 A100 更靠右,根本原因是下面哪一个?",
+  a:["它的带宽相对算力更弱了","它的峰值算力高出很多","它的共享内存容量更大","它的线程数上限更高了"],c:0,
+  e:"脊点=算力/带宽。3060 带宽掉到约 1/5 而算力只掉到约 1/1.7,带宽掉更狠 → 脊点右移。"},
+ {q:"测显存带宽时,数据量若小于 L2 缓存,会发生什么?",
+  a:["测到的是缓存带宽偏高","测到的就是显存带宽","结果会比真实值偏低","对测量结果毫无影响"],c:0,
+  e:"小数据被 L2 兜住,测到的是缓存带宽(偏高且失真)。要远大于 L2(A100 40MB)才测到真显存带宽。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——把 AI 和这块卡的脊点比大小。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>
+

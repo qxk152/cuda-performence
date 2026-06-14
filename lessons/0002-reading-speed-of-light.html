@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 02 · 读懂 Speed of Light 报告</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+    --green:#2d4a2d; --greenbg:#d8ecd8;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.78rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .lbl{color:#9cdcfe;} pre .num{color:#b5cea8;} pre .bar{color:#ce9178;} pre .hi{color:#f7d56a;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent);
+    color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>读懂 Speed of Light 报告</h1>
+<p class="sub">Lesson 02 · CUDA 性能调优 · 把 roofline 落到真实数字</p>
+
+<p class="lead">上一节你学会了用 <a href="0001-roofline-mental-model.html">roofline</a> 判断瓶颈。
+但真实工作里,你不会手算算术强度——你会让 <strong>Nsight Compute(ncu)</strong> 替你测,
+然后<mark>读报告</mark>。调优 80% 的时间都花在读报告上。本节你将学会读懂最重要的那一段:<strong>Speed of Light(SOL)</strong>。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 看到一份 ncu 的 Speed of Light 段,
+你能在 10 秒内说出这个 kernel 是<strong>访存瓶颈</strong>、<strong>计算瓶颈</strong>还是<strong>延迟瓶颈</strong>,
+并知道下一步该查什么。
+</div>
+
+<h2>1. Speed of Light 是什么</h2>
+
+<p>ncu 把 kernel 的性能压缩成两个最关键的百分比,这就是 Speed of Light 段——
+"相对光速",即<mark>你跑到了硬件理论极限的百分之多少</mark>:<span class="cite">[1]</span></p>
+
+<table>
+<tr><th>指标</th><th>含义</th></tr>
+<tr><td><code>Compute (SM) Throughput</code></td><td>计算单元用了峰值算力的百分之几</td></tr>
+<tr><td><code>Memory Throughput</code></td><td>访存子系统用了峰值带宽的百分之几</td></tr>
+</table>
+
+<p>这两个数,就是上节 roofline 的两堵墙——只不过 ncu 已经替你算好、归一化成百分比了。
+你要做的不是计算,而是<strong>比较谁高</strong>。</p>
+
+<h2>2. 一份真实报告长什么样</h2>
+
+<p>在 A100 上对一个<strong>逐元素 kernel</strong>(如 <code>y = a*x + y</code>,即 SAXPY)跑
+<code>ncu --section SpeedOfLight ./saxpy</code>,SOL 段大致是:</p>
+
+<pre><code><span class="lbl">  Section: GPU Speed Of Light Throughput</span>
+  ------------------------------------------------------------
+  Metric Name                    Metric Value
+  ------------------------------------------------------------
+  <span class="lbl">Memory Throughput</span>        [%]      <span class="hi">92.41</span>   <span class="bar">|=================  |</span>
+  <span class="lbl">Compute (SM) Throughput</span>  [%]       <span class="num">8.13</span>   <span class="bar">|=                  |</span>
+  DRAM Throughput          [%]      <span class="hi">91.20</span>
+  Duration                 [us]      142.5
+  Achieved Occupancy       [%]      85.30
+  ------------------------------------------------------------</code></pre>
+
+<p>读法:<strong>Memory 92%,Compute 8%</strong>。访存几乎贴墙,计算几乎空转。
+结论一目了然——<mark>这是访存瓶颈(memory-bound)</mark>。跟上节预测的"逐元素算子总是访存瓶颈"完全吻合。</p>
+
+<blockquote>
+别去优化那 8% 的计算——它不是瓶颈。要让这个 kernel 变快,只能从访存下手:
+减少读写字节、提高带宽利用(向量化、合并访问)。
+</blockquote>
+
+<h2>3. 三种诊断:一张决策表</h2>
+
+<p>把 SOL 的两个数字一比,kernel 必然落入三种情况之一。<mark>这张表是本节的核心,请记住它。</mark></p>
+
+<table>
+<tr><th>Memory %</th><th>Compute %</th><th>诊断</th><th>下一步</th></tr>
+<tr><td>高(&gt;60)</td><td>低</td><td><strong>访存瓶颈</strong></td><td>看 Memory Workload Analysis</td></tr>
+<tr><td>低</td><td>高(&gt;60)</td><td><strong>计算瓶颈</strong></td><td>看 Compute Workload Analysis</td></tr>
+<tr><td>低</td><td>低</td><td><strong>延迟瓶颈</strong></td><td>看 Occupancy / Scheduler</td></tr>
+</table>
+
+<p>第三种——<strong>两个都低</strong>——是新手最容易看漏的。它不代表 kernel 很闲,而是说两种资源都没喂饱,
+通常是<mark>并行度不够、延迟没藏住</mark>:活跃的 warp 太少,SM 在干等内存返回。
+这时优化访存或计算都没用,要提高 <strong>occupancy</strong> 或指令级并行(ILP)。<span class="cite">[1]</span></p>
+
+<div class="keypt">
+<strong>"两高"会出现吗?</strong> 几乎不会。一个 kernel 同一时刻通常只被一种资源卡住。
+如果两个都接近 100%,恭喜——这个 kernel 已经接近最优,没多少优化空间了。
+</div>
+
+<h2>4. ncu 还会直接告诉你结论</h2>
+
+<p>你甚至不必自己查表。ncu 有内置的 <strong>规则引擎(guided analysis)</strong>,会在报告里直接写一句诊断,
+比如:<span class="cite">[2]</span></p>
+
+<pre><code><span class="bar">[Warning]</span> This kernel exhibits low compute throughput and
+memory bandwidth utilization relative to peak. Achieved occupancy
+is 12%. Consider increasing occupancy... <span class="hi">→ 延迟瓶颈的典型提示</span></code></pre>
+
+<p>这些 <code>[Warning]</code> 行是 ncu 帮你做的初判,直接顺着它给的方向深挖即可。
+但<strong>你必须能自己验证它对不对</strong>——这正是本节练的能力。</p>
+
+<h2>5. 练习:读报告,下诊断</h2>
+
+<p>下面是 4 份 A100 上的真实 SOL 片段。凭第 3 节的决策表判断瓶颈。点选项看反馈。</p>
+
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> DRAM Throughput 和 Memory Throughput 有啥区别?occupancy 多少算低?
+某份报告看不懂?我是你的老师,把疑问抛过来。
+</div>
+
+<h2>6. 把它接回你的 A100(等你接入环境时)</h2>
+<p>等你能访问 A100 时,完整抓取并打开报告的命令是:</p>
+<pre><code>nvcc -arch=sm_80 -o saxpy saxpy.cu
+ncu --set full -o report ./saxpy   <span class="hi"># 存成 report.ncu-rep</span>
+ncu-ui report.ncu-rep              <span class="hi"># 图形界面里看 SOL + roofline 图</span></code></pre>
+<p>图形界面会把 SOL 直接画成上一节那张 roofline 图,你的 kernel 是图上一个点——
+一眼看出它贴着哪堵墙。</p>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#sections-and-rules">Nsight Compute Profiling Guide — Sections &amp; Rules</a>
+——读"GPU Speed Of Light"小节即可,它精确定义了这两个吞吐指标的含义。这是本节最高信任的来源。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide">NVIDIA, Nsight Compute Profiling Guide</a><br>
+[2] <a href="https://developer.nvidia.com/blog/using-nsight-compute-to-inspect-your-kernels/">NVIDIA, Using Nsight Compute to Inspect your Kernels</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0001-roofline-mental-model.html">Lesson 01 · Roofline</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">Roofline 速查表</a> ·
+任务 → <a href="../MISSION.md">Mission</a></p>
+<p><strong>下一节预告</strong>:深入访存瓶颈——什么是"访存合并(coalescing)",为什么它能成倍改变带宽利用。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"报告:Memory 88%,Compute 15%,Occupancy 80%。诊断?",
+  a:["这个内核属于访存瓶颈","这个内核属于计算瓶颈","这个内核属于延迟瓶颈","这个内核已接近最优"],c:0,
+  e:"Memory 高、Compute 低 → 访存瓶颈。下一步看 Memory Workload Analysis 找具体访存问题。"},
+ {q:"报告:Memory 22%,Compute 91%,Occupancy 75%。诊断?",
+  a:["这个内核属于访存瓶颈","这个内核属于计算瓶颈","这个内核属于延迟瓶颈","这个内核已接近最优"],c:1,
+  e:"Compute 贴墙、Memory 低 → 计算瓶颈。看 Compute Workload Analysis,考虑更高效指令或 tensor core。"},
+ {q:"报告:Memory 18%,Compute 14%,Occupancy 11%。诊断?",
+  a:["这个内核属于访存瓶颈","这个内核属于计算瓶颈","这个内核属于延迟瓶颈","这个内核已接近最优"],c:2,
+  e:"两个都低 + occupancy 极低 → 延迟瓶颈。并行度不足,SM 在干等。要提高 occupancy 或 ILP。"},
+ {q:"报告:Memory 19%,Compute 12%,Occupancy 90%。最该先查什么?",
+  a:["立刻去优化访存合并方式","立刻去换更快的计算指令","查为何高占用却两项都低","判定内核已经达到最优"],c:2,
+  e:"占用很高但两项都低,说明 warp 虽多却都在停等(如长延迟依赖、同步、分支)。要查 Scheduler/Stall 原因,而非盲目优化访存或计算。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再对照决策表想想——先比 Memory% 和 Compute% 谁高。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

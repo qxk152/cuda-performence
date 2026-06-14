@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUDA 性能调优实战指南</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem;
+    font-size:19px; -webkit-font-smoothing:antialiased;
+  }
+  h1{font-size:2rem; line-height:1.15; margin:0 0 .3rem; font-weight:700; letter-spacing:-.02em}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2.5rem; font-size:1.1rem}
+  h2{font-size:1.35rem; margin:2.5rem 0 .8rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem; font-weight:600}
+  ul{list-style:none; padding:0; margin:0}
+  li{margin:.6rem 0; padding:.8rem 1rem; border-left:3px solid var(--accent); background:var(--hl); border-radius:0 6px 6px 0; transition:transform .15s}
+  li:hover{transform:translateX(4px)}
+  a{color:var(--accent); text-decoration:none; font-weight:500}
+  a:hover{text-decoration:underline}
+  .lesson-num{font-variant-numeric:tabular-nums; color:var(--muted); font-size:.85rem; margin-right:.4rem}
+  .desc{color:var(--ink); font-size:1rem}
+  .ref{margin-top:2rem; padding:1rem 1.2rem; background:var(--code); border-radius:6px; border:1px solid var(--rule)}
+  .ref a{font-weight:600}
+  footer{margin-top:4rem; color:var(--muted); font-size:.85rem; text-align:center}
+</style>
+</head>
+<body>
+
+<h1>CUDA 性能调优实战指南</h1>
+<p class="sub">从零到独立调优 AI Kernel 的系统学习路径</p>
+
+<h2>课程讲义</h2>
+<ul>
+  <li><span class="lesson-num">01</span><a class="desc" href="lessons/0001-roofline-mental-model.html">Roofline Mental Model — 先判断瓶颈，再谈优化</a></li>
+  <li><span class="lesson-num">02</span><a class="desc" href="lessons/0002-reading-speed-of-light.html">Reading Speed of Light — 读懂硬件性能极限</a></li>
+  <li><span class="lesson-num">03</span><a class="desc" href="lessons/0003-memory-coalescing.html">Memory Coalescing — 访存合并与对齐</a></li>
+  <li><span class="lesson-num">04</span><a class="desc" href="lessons/0004-shared-memory.html">Shared Memory — 共享内存优化</a></li>
+  <li><span class="lesson-num">05</span><a class="desc" href="lessons/0005-bank-conflict-and-tiling.html">Bank Conflict and Tiling — Bank 冲突与分块</a></li>
+  <li><span class="lesson-num">06</span><a class="desc" href="lessons/0006-occupancy-and-launch-config.html">Occupancy and Launch Config — 占用率与启动配置</a></li>
+  <li><span class="lesson-num">07</span><a class="desc" href="lessons/0007-dual-gpu-roofline-hands-on.html">Dual GPU Roofline Hands-On — 双卡 Roofline 实操</a></li>
+  <li><span class="lesson-num">08</span><a class="desc" href="lessons/0008-reduction-optimization.html">Reduction Optimization — 规约优化</a></li>
+</ul>
+
+<div class="ref">
+  <a href="reference/roofline-cheatsheet.html">Roofline Cheatsheet</a> — 快速参考卡片
+</div>
+
+<footer>
+  <a href="https://github.com/qxk152/cuda-performence">GitHub 仓库</a>
+</footer>
+
+</body>
+</html>
