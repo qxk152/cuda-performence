@@ -44,9 +44,7 @@ cuda-performence/
 ├── MISSION.md         # 学习任务书
 ├── NOTES.md           # 通用笔记
 ├── RESOURCES.md       # 推荐资源汇总
-├── SUMMARY.md         # GitBook 目录索引
-├── book.json          # HonKit 构建配置
-└── .gitbook.yaml      # GitBook 元数据
+└── README.md          # 项目说明与结构索引
 ```
 
 ### 目录说明
