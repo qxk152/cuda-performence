@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 09 · Softmax / LayerNorm 融合(双卡)</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.76rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;} pre .ty{color:#4ec9b0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Softmax / LayerNorm 融合</h1>
+<p class="sub">Lesson 09 · CUDA 性能调优 · 把 reduction 与逐元素算子合成一个 kernel</p>
+
+<p class="lead">上一节把 <a href="0008-reduction-optimization.html">reduction</a> 调到了带宽极限——单个求和算子,我们亲手验证了
+"<mark>天花板是带宽不是算力</mark>",且 grid-stride 之后再精修归约树收益≈0。这一节回答那节课结尾留的问题:
+<strong>既然单个算子已经吃满带宽,再快从哪来?</strong> 答案是<strong>融合(fusion)</strong>——把多个算子合成一个 kernel,
+省掉中间结果在 HBM 上的往返。Softmax 和 LayerNorm 是 AI 里最典型的"reduction + 逐元素"组合,正是融合的主战场。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能说清"未融合的 softmax 为什么要把数据读 3–5 遍",
+能手写一个<strong>每行一个 block、一趟读完</strong>的融合 softmax kernel(online 算法),
+并在 3060 上实测它比"多 kernel 拼接"版快多少——再用带宽算出它离极限还差几成。
+</div>
+
+<h2>1. 先看未融合版:数据被读了几遍?</h2>
+
+<p>Softmax 对一行 <code>x[0..N)</code> 做:<code>y_i = exp(x_i - max) / Σexp(x_j - max)</code>。
+减 max 是为了数值稳定(防 <code>exp</code> 溢出)。如果你用现成算子库逐个拼,典型是 <strong>4 个 kernel</strong>:</p>
+
+<pre><code><span class="cm">// 朴素四趟:每一趟都把整行从 HBM 读出 / 写回一次</span>
+m   = reduce_max(x)        <span class="cm">// 趟1:读 x</span>
+e   = exp(x - m)           <span class="cm">// 趟2:读 x,写 e</span>
+s   = reduce_sum(e)        <span class="cm">// 趟3:读 e</span>
+y   = e / s                <span class="cm">// 趟4:读 e,写 y</span></code></pre>
+
+<p>数一下 HBM 流量:<code>x</code> 读 2 次、<code>e</code> 写 1 读 2、<code>y</code> 写 1 ——
+对一行 N 个 float,光是<strong>访存就是 6N 字节量级</strong>(理想下限只需读 x 一遍、写 y 一遍 = 2N)。
+而每个 kernel 还各有一次<strong>启动开销 + 把行数据反复进出 L2/HBM</strong>。reduction 那节告诉我们:
+访存瓶颈算子的耗时正比于搬的字节数。<mark>读 3 倍的数据,就是慢 3 倍。</mark></p>
+
+<div class="keypt">
+<strong>融合的本质 = 减少 HBM 往返。</strong> 把这 4 步塞进<strong>一个 kernel</strong>:一行数据进 shared/寄存器后,
+max、exp、sum、除法全在片上做完,只读一次 x、写一次 y。中间量 <code>e</code> 根本不落 HBM。
+这就是 AI 算子提速的主线——不是把某一步算得更快,而是<strong>让数据少搬几趟</strong>。
+</div>
+
+<h2>2. 融合 softmax:每行一个 block,一趟读完</h2>
+
+<p>布局:输入是 <code>[rows × N]</code>,<strong>一个 block 负责一行</strong>。block 内线程用 grid-stride 把这一行扫一遍,
+同时做 reduction。关键技巧叫 <strong>online softmax</strong>:一边读一边维护 <code>(running_max, running_sum)</code>,
+读到更大的值时把已累加的 sum 按比例缩放。这样<strong>只需扫一遍 x 就同时拿到 max 和 sum</strong>,而不是分两趟。<span class="cite">[1]</span></p>
+
+<pre><code><span class="cm">// 每个线程先在寄存器里 online 归约自己负责的那些元素</span>
+<span class="kw">float</span> m = -INFINITY, s = <span class="num">0.0f</span>;
+<span class="kw">for</span> (<span class="kw">int</span> i = tid; i < N; i += blockDim.x) {
+    <span class="kw">float</span> x = row[i];
+    <span class="kw">float</span> m_new = fmaxf(m, x);
+    s = s * <span class="fn">__expf</span>(m - m_new) + <span class="fn">__expf</span>(x - m_new);  <span class="hi">// 旧 sum 按新 max 缩放</span>
+    m = m_new;
+}</code></pre>
+
+<p>每个线程算完自己那份 <code>(m, s)</code> 后,block 内还要把这些<strong>局部 (max,sum) 对</strong>合并成全行的一个。
+合并规则和上面一行一样:两个 <code>(m₁,s₁)</code> 和 <code>(m₂,s₂)</code> 取 <code>M=max(m₁,m₂)</code>,
+<code>S=s₁·exp(m₁−M)+s₂·exp(m₂−M)</code>。用<a href="0008-reduction-optimization.html">上一节</a>的 <strong>warp shuffle</strong> 做这个归约——
+只是被归约的不再是单个 float,而是这个二元组。</p>
+
+<pre><code><span class="cm">// warp 内对 (m,s) 二元组做 shuffle 归约</span>
+<span class="kw">for</span> (<span class="kw">int</span> off = <span class="num">16</span>; off > <span class="num">0</span>; off >>= <span class="num">1</span>) {
+    <span class="kw">float</span> m2 = <span class="fn">__shfl_down_sync</span>(<span class="num">0xffffffff</span>, m, off);
+    <span class="kw">float</span> s2 = <span class="fn">__shfl_down_sync</span>(<span class="num">0xffffffff</span>, s, off);
+    <span class="kw">float</span> M = fmaxf(m, m2);
+    s = s * <span class="fn">__expf</span>(m - M) + s2 * <span class="fn">__expf</span>(m2 - M);
+    m = M;
+}</code></pre>
+
+<p>拿到全行的 <code>(M, S)</code> 后(广播给所有线程),<strong>第二趟</strong>再扫一遍写出
+<code>y_i = exp(x_i − M) / S</code>。注意这第二趟读 x 的<strong>代价无法避免</strong>——
+要写 y 就得再读一次 x(除非 N 小到能整行缓存进 shared,那样连第二趟读 HBM 都省了)。</p>
+
+<div class="keypt">
+<strong>online softmax 把"max 一趟、sum 一趟"压成一趟。</strong> 配合每行一个 block,
+整个 softmax 只剩 <strong>读 x 两趟(归约一趟 + 写出一趟)、写 y 一趟</strong>,从 6N 砍到 3N。
+若整行装得进 shared(N ≤ 几千),第二趟从 shared 读 → HBM 流量逼近理想的 2N。
+</div>
+
+<h2>3. N 装得下时:整行进 shared,逼近 2N 下限</h2>
+
+<p>当 N 不大(比如 transformer 的 vocab 之外的多数归一化,N=768/1024/4096),
+一行能整个放进 shared memory。那么策略变成:<strong>第一趟把整行读进 shared(顺带 online 归约)</strong>,
+第二趟<strong>从 shared 读、算 exp、写 y</strong>。HBM 上 x 只读一次、y 只写一次 = <strong>2N,触到理想下限</strong>。</p>
+
+<pre><code><span class="kw">extern</span> <span class="kw">__shared__</span> <span class="kw">float</span> srow[];   <span class="cm">// 动态 shared,大小 = N*4</span>
+<span class="cm">// 趟1:读 HBM → shared,同时累积局部 (m,s)</span>
+<span class="kw">for</span> (<span class="kw">int</span> i = tid; i < N; i += blockDim.x) srow[i] = row[i];
+<span class="cm">// ...block 内归约出全行 (M,S)...</span>
+<span class="cm">// 趟2:从 shared 读,无需再碰 HBM 的 x</span>
+<span class="kw">for</span> (<span class="kw">int</span> i = tid; i < N; i += blockDim.x)
+    out[i] = <span class="fn">__expf</span>(srow[i] - M) / S;</code></pre>
+
+<p>这正是 <a href="0004-shared-memory.html">Lesson 04</a> shared memory 的标准用法:
+<strong>一份数据要被读多次时,先搬进片上,后续都从片上读</strong>。softmax 的 x 被读两次(归约 + 写出),
+所以缓存它正好划算。</p>
+
+<h2>4. LayerNorm:同一套骨架,换成 (sum, sum²)</h2>
+
+<p>LayerNorm 对一行做:<code>y = (x − μ) / √(σ² + ε) · γ + β</code>,其中 <code>μ</code> 是均值、<code>σ²</code> 是方差。
+结构和 softmax 一模一样——<strong>先一趟归约求统计量,再一趟逐元素归一化</strong>。区别只在归约的是什么:</p>
+
+<table>
+<tr><th></th><th>Softmax</th><th>LayerNorm</th></tr>
+<tr><td>归约量</td><td>(max, Σexp)</td><td>(Σx, Σx²)</td></tr>
+<tr><td>统计量</td><td>M, S</td><td>μ=Σx/N, σ²=Σx²/N − μ²</td></tr>
+<tr><td>逐元素</td><td>exp(xᵢ−M)/S</td><td>(xᵢ−μ)/√(σ²+ε)·γ+β</td></tr>
+</table>
+
+<pre><code><span class="cm">// LayerNorm 第一趟:一次 shuffle 归约同时拿到 sum 和 sum_sq</span>
+<span class="kw">float</span> sum = <span class="num">0</span>, sum_sq = <span class="num">0</span>;
+<span class="kw">for</span> (<span class="kw">int</span> i = tid; i < N; i += blockDim.x) {
+    <span class="kw">float</span> v = row[i];
+    sum += v;  sum_sq += v * v;
+}
+<span class="cm">// 对 (sum, sum_sq) 各做一次 warp shuffle + block 归约</span>
+<span class="kw">float</span> mean = sum / N;
+<span class="kw">float</span> var  = sum_sq / N - mean * mean;   <span class="hi">// 一遍法:E[x²]-E[x]²</span></code></pre>
+
+<div class="keypt">
+<strong>一遍法方差 <code>E[x²]−E[x]²</code> 在 fp32 下可能因抵消而掉精度。</strong>
+工业实现(如 Apex、cuDNN)多用 <strong>Welford 算法</strong>:online 维护 <code>(count, mean, M2)</code>,
+数值更稳,且天然适合 warp 归约。softmax 的 online 缩放、LayerNorm 的 Welford——
+本质都是<strong>"一趟拿到本需多趟的统计量"</strong>。<span class="cite">[2]</span>
+</div>
+
+<h2>5. 实测:融合 vs 多 kernel(3060 / sm_86)</h2>
+
+<p>评判融合好不好,还是回到<strong>带宽</strong>。融合版的理想 HBM 流量是 <code>(读x + 写y)</code>;
+未融合版是它的 2–3 倍。所以预期加速比≈流量比,<strong>而不是</strong>算力比。编译跑(3060 用 <code>sm_86</code>,A100 用 <code>sm_80</code>):</p>
+
+<pre><code>nvcc -O3 -arch=sm_86 softmax_fused.cu -o sm
+./sm                     <span class="cm"># 比对 fused vs 4-kernel 的耗时与等效带宽</span></code></pre>
+
+<table>
+<tr><th>看什么</th><th>含义</th><th>期望</th></tr>
+<tr><td>等效带宽 = 总字节/耗时</td><td>融合版总字节≈2N·rows</td><td>✅ 上到峰值 70%+</td></tr>
+<tr><td>fused / 4-kernel 加速比</td><td>≈ 流量比 ≈ 2–3x</td><td>✅ 与字节比吻合</td></tr>
+<tr><td>DRAM Throughput(ncu)</td><td>融合后应接近 SOL Memory</td><td>⚠️ WSL 下采不到,见下</td></tr>
+</table>
+
+<blockquote>WSL 提醒:你的 3060 在 WSL2 下,<code>ncu</code> 的硬件性能计数器<strong>不可用</strong>
+(实测会报 "Profiling is not supported on device ... WSL")。所以这一节的验证靠 <strong>kernel 内 event 计时 + 手算等效带宽</strong>,
+与 reduction 那节同款套路;DRAM Throughput 那行留给 A100(原生 Linux)跑。</blockquote>
+
+<h2>6. 为什么这是 AI 算子的提速主线</h2>
+
+<p>Transformer 里 softmax 和 LayerNorm 极其密集:每个 attention 有 softmax,每个子层前后有 LayerNorm。
+它们都是<strong>访存瓶颈</strong>的"reduction + 逐元素"算子。单独看每个都已经被框架调到接近带宽极限,
+所以现代推理/训练引擎的提速几乎都来自<strong>更大范围的融合</strong>:</p>
+
+<table>
+<tr><th>融合</th><th>省掉的 HBM 往返</th></tr>
+<tr><td>FlashAttention</td><td>QKᵀ→softmax→·V 全程不落 N×N 的注意力矩阵</td></tr>
+<tr><td>fused LayerNorm + 残差</td><td>residual add 与 norm 合一,中间和不落 HBM</td></tr>
+<tr><td>fused bias + GELU</td><td>逐元素链合并,一趟读写</td></tr>
+</table>
+
+<p>你这一节手写的"每行一个 block、online 归约、一趟读完"正是 FlashAttention 的<strong>核心积木</strong>——
+它把整个 attention 拆成分块的 online softmax,从不物化 N×N 矩阵。<mark>理解了融合 softmax,你就理解了 FlashAttention 为什么快。</mark></p>
+
+<h2>7. 练习:融合决策(混合前几节)</h2>
+<p>点选项看反馈。这些题把 roofline、带宽、shared、warp shuffle 都串起来了。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> 想看一份完整可编译的融合 softmax(online + warp shuffle,带 4-kernel 对照基线)?
+Welford 的 warp 归约具体怎么写?N 超过 shared 容量(比如词表 softmax,N=5万)该怎么分块?
+FlashAttention 的 online softmax 和这里的有什么不同?把问题抛来。我是你的老师。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://arxiv.org/abs/1805.02867">Milakov & Gimelshein, "Online normalizer calculation for softmax"(NVIDIA, 2018)</a>
+——online softmax 的原始论文,一趟同时算 max 与 sum 的推导就在这,FlashAttention 的软最大化也基于它。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://arxiv.org/abs/1805.02867">Milakov & Gimelshein, NVIDIA — Online normalizer calculation for softmax (2018)</a><br>
+[2] <a href="https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm">Welford's online algorithm — 数值稳定的一遍法方差</a><br>
+[3] <a href="https://arxiv.org/abs/2205.14135">Dao et al. — FlashAttention: Fast and Memory-Efficient Exact Attention (2022)</a></p>
+<p><strong>本节关联</strong>:
+Reduction → <a href="0008-reduction-optimization.html">Lesson 08</a> ·
+Shared → <a href="0004-shared-memory.html">Lesson 04</a> ·
+合并 → <a href="0003-memory-coalescing.html">Lesson 03</a> ·
+Roofline → <a href="0001-roofline-mental-model.html">Lesson 01</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:把视野拉到 attention 全链——从这节的融合 softmax 走到 FlashAttention 的分块思想,
+看"不物化中间矩阵"如何把访存瓶颈彻底改写。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"未融合 softmax 用 4 个 kernel 拼。它慢的主因是:",
+  a:["exp 算力不够","数据被反复读写 HBM(约6N)","occupancy 太低","bank conflict"],c:1,
+  e:"softmax 是访存瓶颈。4 趟各自读写整行,HBM 流量约 6N,而理想只需 2N。慢在搬数据,不在算 exp。"},
+ {q:"online softmax 的核心好处是:",
+  a:["减少 exp 调用次数","一趟同时算出 max 和 sum","提高数值精度","降低寄存器占用"],c:1,
+  e:"维护 (running_max, running_sum) 并按新 max 缩放旧 sum,一遍扫描同时得到两个统计量,省掉单独的 max 趟。"},
+ {q:"融合 softmax 里 block 内归约的是什么?",
+  a:["单个 float","(max, sum) 二元组","整行 N 个值","梯度"],c:1,
+  e:"每个线程算出局部 (m,s),再用 warp shuffle 把这些二元组按 online 规则合并成全行的 (M,S)。"},
+ {q:"N 整行能装进 shared 时,HBM 流量能压到:",
+  a:["6N","4N","2N(读x一次+写y一次)","N"],c:2,
+  e:"第一趟读 x 进 shared,第二趟从 shared 读算,HBM 上 x 只读一次、y 只写一次 = 2N,触到理想下限。"},
+ {q:"LayerNorm 融合相比 softmax,改的是:",
+  a:["布局从每行一block变每列","归约量换成 (Σx, Σx²)","不需要第二趟","不能用 warp shuffle"],c:1,
+  e:"骨架完全一样:一趟归约出统计量、一趟逐元素。只是归约 (sum,sum_sq) 求 μ/σ²,工业上常用 Welford 更稳。"},
+ {q:"判断融合做得好不好,主要看:",
+  a:["Compute% 是否拉满","等效带宽是否接近峰值","exp 指令吞吐","block 数量"],c:1,
+  e:"访存瓶颈算子永远看带宽。融合后总字节≈2N,等效带宽=总字节/耗时上到峰值 70%+ 就接近极限了。"},
+ {q:"FlashAttention 为什么和这节强相关?",
+  a:["它用了更快的 exp","它就是分块的 online softmax,不物化 N×N 矩阵","它放弃了数值稳定","它只在算力卡上有效"],c:1,
+  e:"FlashAttention 把 attention 拆成分块 online softmax,QKᵀ→softmax→·V 全程不把 N×N 注意力矩阵落 HBM。本节的积木就是它的核心。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——融合是为省 HBM 往返;访存瓶颈看带宽;归约可推广到二元组。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>
+
