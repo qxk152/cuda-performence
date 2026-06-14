@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 04 · Shared Memory:少读,而非读得对</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.78rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;} pre .ty{color:#4ec9b0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Shared Memory:少读,而非读得对</h1>
+<p class="sub">Lesson 04 · CUDA 性能调优 · 访存瓶颈的第二大武器</p>
+
+<p class="lead">前三节都在教你<strong>把全局内存读得对</strong>(合并、对齐)。这一节是质变:
+有些数据会被<mark>反复读很多次</mark>。与其每次都跑去显存这条"远路",不如搬进片上的
+<strong>shared memory</strong> 读一次、复用多次——直接<strong>减少总访存量</strong>,把算术强度抬上去。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能识别一个 kernel 有没有<strong>数据复用</strong>,
+理解 shared memory 为什么快,并掌握 <code>__shared__</code> + <code>__syncthreads()</code> 的基本用法与那个最容易出 bug 的同步点。
+</div>
+
+<h2>1. 内存金字塔:远近差百倍</h2>
+
+<p>上一节出现过缓存层级。把它按"离计算单元多远 / 多快"排成金字塔:<span class="cite">[1]</span></p>
+
+<table>
+<tr><th>层级</th><th>位置</th><th>延迟(约)</th><th>谁能访问</th></tr>
+<tr><td>寄存器</td><td>SM 内</td><td>~1 周期</td><td>单线程私有</td></tr>
+<tr><td><strong>Shared memory</strong></td><td>SM 内(片上 SRAM)</td><td>~20-30 周期</td><td><strong>同一 block 内所有线程</strong></td></tr>
+<tr><td>L2 缓存</td><td>片上,全 GPU 共享</td><td>~200 周期</td><td>所有线程(自动)</td></tr>
+<tr><td>全局内存 HBM</td><td>板上,SM 外</td><td>~400-800 周期</td><td>所有线程</td></tr>
+</table>
+
+<p>关键差距:<mark>shared memory 比全局内存快约一个数量级</mark>。而且它和 L1 共用同一块物理 SRAM——
+区别在于 shared memory 是<strong>你手动管理</strong>的(你决定放什么、何时放),不像 L1/L2 是硬件自动的、不可控的。</p>
+
+<blockquote>
+上一节说"别依赖缓存救场",因为缓存命中不可控。shared memory 就是那个<strong>可控版的缓存</strong>:
+你亲手把热数据钉在片上,保证后续访问都是快的。
+</blockquote>
+
+<h2>2. 什么时候用:看「数据复用」</h2>
+
+<p>shared memory 不是万能药。它只在一种情况下有用:<strong>同一份数据被一个 block 内多个线程、或同一线程多次读取</strong>。</p>
+
+<table>
+<tr><th>场景</th><th>有复用?</th><th>shared memory 有用?</th></tr>
+<tr><td>逐元素 <code>y[i]=a*x[i]</code>(每个数只读一次)</td><td>❌ 无</td><td>没用,徒增开销</td></tr>
+<tr><td>矩阵乘 / 卷积 / 模板计算(同一数据被多线程反复用)</td><td>✅ 有</td><td>巨大收益</td></tr>
+<tr><td>block 内归约(reduction)</td><td>✅ 有</td><td>标准做法</td></tr>
+</table>
+
+<div class="keypt">
+<strong>判断口诀:</strong> 先问"<mark>这份数据会被读不止一次吗?</mark>"——
+没有复用,shared memory 帮不上忙(数据只读一次,搬进片上再读还是读一次,白搭)。
+有复用,才值得搬进来:<strong>从全局读 1 次 → 在 shared 里读 N 次</strong>,总全局访存量降为 1/N。
+</div>
+
+<h2>3. 三步用法 + 那个致命的同步点</h2>
+
+<p>shared memory 的标准套路就三步,但<strong>第二步漏了会出隐蔽的错误结果</strong>:</p>
+
+<pre><code><span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">kernel</span>(<span class="kw">float</span>* g) {
+    <span class="cm">// ① 声明片上数组(整个 block 共享)</span>
+    <span class="kw">__shared__</span> <span class="kw">float</span> tile[<span class="num">256</span>];
+
+    <span class="cm">// ② 协作加载:每个线程搬一份全局数据进 shared(合并访问!)</span>
+    tile[threadIdx.x] = g[blockIdx.x * <span class="num">256</span> + threadIdx.x];
+
+    <span class="hi">__syncthreads();   // ★ 屏障:等全 block 都加载完,再往下走</span>
+
+    <span class="cm">// ③ 现在随便复用 tile[...],都是片上高速访问</span>
+    <span class="kw">float</span> v = tile[threadIdx.x] + tile[(threadIdx.x + <span class="num">1</span>) % <span class="num">256</span>];
+    <span class="cm">// ...</span>
+}</code></pre>
+
+<p><code>__syncthreads()</code> 是一道 <strong>block 内屏障</strong>:所有线程都到齐了才一起继续。
+为什么非要它?因为线程是<strong>分 warp 异步执行</strong>的——</p>
+
+<blockquote>
+没有屏障,线程 5 可能在线程 200 还没把 <code>tile[200]</code> 写进去时,就抢先去读 <code>tile[200]</code>,
+读到一堆<strong>未初始化的垃圾</strong>。而且这种 bug 时隐时现(取决于调度),极难调试。
+</blockquote>
+
+<div class="keypt">
+<strong>铁律:</strong> 在"<em>一批线程写 shared</em>"和"<em>另一批线程读这些位置</em>"之间,
+<mark>必须有 <code>__syncthreads()</code></mark>。<br>
+<strong>陷阱:</strong> 它必须被 block 内<strong>所有</strong>线程执行到。
+放进 <code>if</code> 分支里、只有部分线程到达 → <strong>整个 block 永久死锁</strong>。<span class="cite">[1]</span>
+</div>
+
+<h2>4. 为什么这是在"抬高算术强度"</h2>
+
+<p>回到 <a href="0001-roofline-mental-model.html">第 1 节</a>的 roofline。shared memory 的本质是<strong>减少全局访存量</strong>(分母变小),
+于是算术强度 = FLOPs / Bytes <mark>上升</mark>——kernel 在 roofline 图上<strong>向右移动</strong>,
+从访存瓶颈一侧挪向计算瓶颈一侧。</p>
+
+<p>这就是矩阵乘 tiling(下一节的主题)的核心思想:不用 shared memory 时,每个输出元素都要从全局反复读整行整列;
+用了之后,一块数据加载一次、被整个 block 复用,全局访存量降一个数量级,GEMM 才可能从访存瓶颈变成计算瓶颈、逼近峰值算力。<span class="cite">[2]</span></p>
+
+<h2>5. 练习:该不该用 / 用对了吗</h2>
+<p>凭前面的口诀与铁律判断。点选项看反馈。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> shared memory 容量多大(A100)?它怎么影响 occupancy?
+动态 shared memory 怎么写?为什么它和 L1 共用 SRAM?把 kernel 贴来我帮你看复用机会。我是你的老师。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory">CUDA C++ Best Practices Guide — Shared Memory</a>
+——讲清楚了 shared memory 的用途、协作加载模式与同步。配合 <a href="https://github.com/gpu-mode/lectures">GPU MODE</a> 的矩阵乘讲解更佳。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory">NVIDIA, CUDA C++ Best Practices Guide — Shared Memory</a><br>
+[2] <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory">NVIDIA, CUDA C++ Programming Guide — Shared Memory(矩阵乘示例)</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0003-memory-coalescing.html">Lesson 03 · 访存合并</a> ·
+Roofline → <a href="0001-roofline-mental-model.html">Lesson 01</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:Bank conflict——shared memory 自己也有"访存模式"的坑,以及矩阵乘 tiling 实战。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"kernel 做 y[i]=relu(x[i]),每个元素只读一次。用 shared memory:",
+  a:["能带来明显的速度提升","几乎无益还增加开销","会直接导致结果出错","必然引发内存的越界"],c:1,
+  e:"无数据复用,搬进 shared 再读还是读一次,纯属多余开销。shared 只对'反复读'的数据有用。"},
+ {q:"线程把数据写进 tile[] 后,马上读别的线程写的 tile 位置,中间没有同步。后果:",
+  a:["结果完全正确无影响","可能读到未初始化值","一定会触发编译报错","性能反而显著变快"],c:1,
+  e:"线程异步执行,缺 __syncthreads() 可能读到别的线程还没写的垃圾值,且 bug 时隐时现。"},
+ {q:"把 __syncthreads() 写进了 if(threadIdx.x<10) 分支内。后果:",
+  a:["完全没有任何的问题","只是略微影响了性能","整个block可能会死锁","自动只同步部分线程"],c:2,
+  e:"屏障必须全 block 线程都到达。只有部分线程执行 → 其余永远等不到 → 死锁。"},
+ {q:"用 shared memory 缓存复用数据,对算术强度(FLOP/Byte)的影响:",
+  a:["全局访存减少强度升高","计算量增加导致升高","强度下降更偏访存侧","对算术强度毫无影响"],c:0,
+  e:"复用使全局访存量(分母)下降,强度升高,kernel 在 roofline 上右移,远离访存瓶颈。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——先问有无复用,再看同步是否正确、是否全员到达。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

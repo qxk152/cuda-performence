@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 05 · Bank Conflict 与矩阵乘 Tiling</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.76rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;} pre .ty{color:#4ec9b0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Bank Conflict 与矩阵乘 Tiling</h1>
+<p class="sub">Lesson 05 · CUDA 性能调优 · 第一个"从慢到快"完整案例</p>
+
+<p class="lead">这是里程碑一节。前四节学的——<a href="0001-roofline-mental-model.html">roofline</a>、
+<a href="0002-reading-speed-of-light.html">读报告</a>、<a href="0003-memory-coalescing.html">合并</a>、
+<a href="0004-shared-memory.html">shared memory</a>——将在这里拧成<strong>一个真实算子(矩阵乘)的完整优化</strong>。
+先补最后一块拼图:shared memory 自己的访存坑——<strong>bank conflict</strong>。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能解释 shared memory 的 32 个 bank 与 bank conflict,
+知道经典的 padding 修复;并看懂 tiled 矩阵乘<strong>为什么快</strong>——把整条优化链落到一个算子上。
+</div>
+
+<h2>1. Bank:shared memory 的 32 条并行通道</h2>
+
+<p>shared memory 快,但它内部分成 <mark>32 个 bank</mark>(对应一个 warp 的 32 个线程)。
+可以把它想成<strong>32 个收银台</strong>:一个 warp 的 32 个线程同时来取数据,
+如果每人走一个不同收银台,<strong>一拍全部办完</strong>;如果多人挤同一个收银台,就得<strong>排队</strong>。<span class="cite">[1]</span></p>
+
+<p>地址到 bank 的映射很简单:<strong>连续的 4 字节字依次落在 bank 0,1,2,…,31,再回到 0</strong>。
+即 <code>bank = (地址/4) % 32</code>。</p>
+
+<table>
+<tr><th>warp 内访问模式</th><th>bank 情况</th><th>代价</th></tr>
+<tr><td>每线程访问连续字 <code>s[tid]</code></td><td>32 线程 → 32 个不同 bank</td><td>✅ 1 拍(无冲突)</td></tr>
+<tr><td>都访问同一地址 <code>s[0]</code></td><td>广播(硬件特例)</td><td>✅ 1 拍(broadcast)</td></tr>
+<tr><td><strong>跨步 32 访问 <code>s[tid*32]</code></strong></td><td>全落 bank 0</td><td>❌ 32 拍(32 路冲突)</td></tr>
+</table>
+
+<div class="keypt">
+<strong>bank conflict</strong> = 同一 warp 内多个线程访问<em>不同地址但同一 bank</em>,被迫串行化。
+N 路冲突 → 慢 N 倍。<mark>注意:全员访问同一地址是"广播",不算冲突。</mark>
+</div>
+
+<h2>2. 经典坑:按列访问二维 shared 数组</h2>
+
+<p>最常见的 bank conflict 来自<strong>按列读一个 <code>[32][32]</code> 的 shared 数组</strong>:</p>
+
+<pre><code><span class="kw">__shared__</span> <span class="kw">float</span> tile[<span class="num">32</span>][<span class="num">32</span>];
+<span class="cm">// warp 内线程 t 读同一列不同行:tile[t][k]</span>
+<span class="cm">// 地址 = t*32 + k,相邻线程地址差 32 个字 → 全部落同一个 bank!</span>
+<span class="kw">float</span> v = tile[threadIdx.x][k];   <span class="hi">// ❌ 32 路 bank conflict</span></code></pre>
+
+<p>修复出奇地简单——<strong>padding(填充)</strong>:把列宽改成 33,人为打乱 bank 对齐:</p>
+
+<pre><code><span class="kw">__shared__</span> <span class="kw">float</span> tile[<span class="num">32</span>][<span class="num">33</span>];   <span class="hi">// ← 多一列,什么都不存</span>
+<span class="cm">// 现在地址 = t*33 + k,相邻线程地址差 33,与 32 互质</span>
+<span class="cm">// → 32 个线程散落到 32 个不同 bank → 无冲突 ✅</span></code></pre>
+
+<p>多分配一列纯属"浪费",却让按列访问从 32 拍降到 1 拍。<mark>这是 CUDA 里性价比最高的一行改动之一。</mark><span class="cite">[1]</span></p>
+
+<blockquote>
+怎么在报告里发现?Nsight Compute 的 Memory Workload Analysis 会直接报
+<code>Shared Memory Bank Conflicts</code> 的数量。非零就说明有冲突,可优化。
+</blockquote>
+
+<h2>3. 回到全局内存:二维按行 vs 按列,差在哪</h2>
+
+<p>上面的 bank 是 <strong>shared memory</strong> 内部的事。但<strong>为什么非要先把数据搬进 shared</strong>?
+根子在全局内存的<a href="0003-memory-coalescing.html">合并访问</a>:一个 warp 的 32 个线程<strong>同一拍一起发访存请求</strong>,
+硬件把它们的地址凑成尽量少的<strong>内存事务</strong>(每次按对齐的 32/128 字节块搬)。
+合不合并只看一件事:<mark>同一 warp 内相邻线程的地址是不是也相邻</mark>。</p>
+
+<p>二维矩阵在显存里是<strong>一维铺开</strong>的(row-major):<code>M[row][col]</code> 的地址 <code>= row*N + col</code>。
+所以"同一行"是连续的,"同一列"是隔着一整行跳的。</p>
+
+<h3>按行访问(threadIdx.x 走 col)—— 合并 ✅</h3>
+<pre><code>线程:   t0      t1      t2          t31
+读:    a[r][0] a[r][1] a[r][2] ... a[r][31]
+地址:    k      k+1     k+2     ...  k+31     <span class="hi">← 连续!</span>
+
+显存:  ┌───────────────────────────────┐
+       │ t0 t1 t2 ............... t31   │  32 线程挤进 1 个 128B 块
+       └───────────────────────────────┘
+       <span class="cm">       1 次事务搞定整个 warp   → 带宽吃满</span></code></pre>
+
+<h3>按列访问(threadIdx.x 走 row)—— 不合并 ❌</h3>
+<pre><code>线程:   t0      t1      t2          t31
+读:    a[0][c] a[1][c] a[2][c] ... a[31][c]
+地址:    c      c+N    c+2N     ...  c+31N    <span class="hi">← 每个差一整行 N!</span>
+
+显存:  ┌────┐        ┌────┐        ┌────┐
+       │ t0 │ ··跳N··│ t1 │ ··跳N··│ t2 │ ···
+       └────┘        └────┘        └────┘
+       <span class="cm">每个线程单独占一个 128B 块 → 32 次事务</span></code></pre>
+
+<p>列访问的代价是双重的:<strong>事务数从 1 变 ~32</strong>,而且每个 128B 块里<strong>只用了想要的 4 字节,其余全浪费</strong>。</p>
+
+<table>
+<tr><th>访问模式</th><th>有效字节 / 搬运字节</th><th>事务数</th><th>结果</th></tr>
+<tr><td>按行</td><td>≈100%</td><td>1~4 次</td><td>✅ 快</td></tr>
+<tr><td>按列</td><td>≈3%(4/128)</td><td>~32 次</td><td>❌ 慢 8~32×</td></tr>
+</table>
+
+<div class="keypt">
+<strong>列访问慢的根因是 stride = N。</strong> 解法<em>不是</em>去改访问模式,而是
+<mark>先用一次按行的合并访问把一块 tile 搬进 shared,再在片上随便按列读</mark>——
+shared 不怕 stride,只怕 bank conflict(上面第 1-2 节)。这就把整条链串起来了:
+<pre><code>global(按行合并搬) ──► shared tile ──► 在 tile 内按列读
+  <span class="cm">coalesced load</span>        <span class="cm">on-chip</span>      <span class="cm">不怕 stride,提防 bank conflict</span></code></pre>
+</div>
+
+<h2>4. 实战:矩阵乘从"慢"到"快"</h2>
+
+<p>现在把整条链拧到一起。计算 <code>C = A × B</code>(都是 N×N)。</p>
+
+<h3>朴素版:每个线程算一个 C 元素</h3>
+<pre><code><span class="kw">float</span> sum = <span class="num">0</span>;
+<span class="kw">for</span> (<span class="kw">int</span> k = <span class="num">0</span>; k < N; k++)
+    sum += A[row*N + k] * B[k*N + col];   <span class="cm">// 全从全局内存读</span>
+C[row*N + col] = sum;</code></pre>
+
+<p>问题:A 的每一行被该行所有线程<strong>反复从全局读 N 次</strong>,B 的每一列同理。
+算术强度极低 → <a href="0001-roofline-mental-model.html">访存瓶颈</a>,远离峰值。这正是
+<a href="0004-shared-memory.html">第 4 节</a>说的"有复用却没用 shared memory"。</p>
+
+<h3>Tiled 版:分块搬进 shared,复用后再算</h3>
+<pre><code><span class="kw">__shared__</span> <span class="kw">float</span> As[T][T], Bs[T][T];   <span class="cm">// T×T 小块(如 32)</span>
+<span class="kw">float</span> sum = <span class="num">0</span>;
+<span class="kw">for</span> (<span class="kw">int</span> t = <span class="num">0</span>; t < N/T; t++) {
+    As[ty][tx] = A[...];   <span class="cm">// ① 协作加载一块 A、一块 B(合并访问!)</span>
+    Bs[ty][tx] = B[...];
+    <span class="hi">__syncthreads();</span>                <span class="cm">// ② 等全块加载完</span>
+    <span class="kw">for</span> (<span class="kw">int</span> k = <span class="num">0</span>; k < T; k++)
+        sum += As[ty][k] * Bs[k][tx];  <span class="cm">// ③ 在 shared 里复用 T 次</span>
+    <span class="hi">__syncthreads();</span>                <span class="cm">// ④ 等全块算完再载下一块</span>
+}
+C[...] = sum;</code></pre>
+
+<p>每块数据<strong>从全局加载 1 次,被整个 block 复用 T 次</strong>,全局访存量降为约 1/T。
+算术强度抬高 → roofline 上<mark>右移</mark> → 从访存瓶颈走向计算瓶颈,可逼近峰值算力。<span class="cite">[2]</span></p>
+
+<h2>5. 五节课在这一个 kernel 里全部现身</h2>
+
+<table>
+<tr><th>学过的概念</th><th>在 tiled GEMM 里的角色</th></tr>
+<tr><td>Roofline(L1)</td><td>朴素版访存瓶颈;tiling 把它右移向计算瓶颈</td></tr>
+<tr><td>读 SOL 报告(L2)</td><td>朴素版 Memory% 高;优化后看 Compute% 升、Duration 降</td></tr>
+<tr><td>合并(L3)</td><td>从全局加载 A/B 块时必须合并,否则加载阶段就慢</td></tr>
+<tr><td>Shared memory(L4)</td><td>tiling 的载体;复用降低全局访存</td></tr>
+<tr><td>Bank conflict(本节)</td><td><code>As/Bs</code> 按列访问可能冲突 → padding 修复</td></tr>
+</table>
+
+<div class="keypt">
+<strong>这就是"独立调优 kernel"的缩影:</strong> 测量定位瓶颈 → 发现访存瓶颈 →
+查访存模式(合并)→ 发现复用机会(shared memory)→ 修 shared 内部冲突(bank)→ 再测验证。
+<mark>你已经掌握了这条完整链路。</mark>
+</div>
+
+<h2>6. 练习:综合判断(混合前几节)</h2>
+<p>本练习<strong>交错</strong>了前几节的概念——这正是检验你是否真懂的方式。点选项看反馈。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> 为什么 padding 加 1 就够?broadcast 和 conflict 怎么区分?
+tiling 的 block 大小怎么选?想看完整可编译的 tiled GEMM 代码?把问题抛来。我是你的老师。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-aa">CUDA C++ Best Practices Guide — Shared Memory in Matrix Multiplication</a>
+——官方用矩阵乘逐步演示 tiling 与 bank conflict,与本节完全对应,最高信任来源。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-and-memory-banks">NVIDIA, CUDA C++ Best Practices Guide — Shared Memory and Memory Banks</a><br>
+[2] <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory">NVIDIA, CUDA C++ Programming Guide — Shared Memory(矩阵乘示例)</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0004-shared-memory.html">Lesson 04 · Shared Memory</a> ·
+合并 → <a href="0003-memory-coalescing.html">Lesson 03</a> ·
+Roofline → <a href="0001-roofline-mental-model.html">Lesson 01</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:Occupancy 与 launch 配置——当访存已优化好,如何用足够的并行度藏住延迟。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"warp 内线程都访问 s[threadIdx.x](连续字)。bank 情况:",
+  a:["落在三十二个不同bank","全部落在同一个bank上","引发严重的多路冲突","会触发广播的机制吧"],c:0,
+  e:"连续字依次映射到 bank 0..31,32 线程各占一个 bank → 无冲突,1 拍完成。"},
+ {q:"shared 数组 tile[32][32],warp 内线程读 tile[tid][k](按列)。后果:",
+  a:["完全没有任何的冲突","发生三十二路bank冲突","属于广播没有的代价","加载阶段未合并访问"],c:1,
+  e:"地址差 32 字 → 全落同一 bank → 32 路冲突,慢 32 倍。改成 [32][33] padding 即可解决。"},
+ {q:"row-major 矩阵,warp 内 threadIdx.x 走 col:读 a[r][tx]。全局访存:",
+  a:["合并地址连续一次事务","按列跨步无法合并访存","会触发广播机制吧","落在同一个bank冲突"],c:0,
+  e:"同一行相邻列地址连续(差 1)→ 32 线程挤进一个 128B 块 → 1 次事务,完全合并。"},
+ {q:"换成 threadIdx.x 走 row:读 a[tx][c]。全局访存后果:",
+  a:["仍然是完美的合并","相邻线程地址差N不合并","这属于bank广播","跟访问模式无关系"],c:1,
+  e:"列访问 stride=N,相邻线程地址隔一整行 → ~32 次事务,每块只用 4/128 字节,慢 8~32×。"},
+ {q:"已知按列读全局很慢。CUDA 里的正解是:",
+  a:["反正没办法只能忍","循环展开多读几个","按行合并搬进shared再按列读","直接改用更大的block"],c:2,
+  e:"用一次按行的合并访问把 tile 搬进 shared,片上不怕 stride(只提防 bank conflict)。这就是 tiling 的动机。"},
+  a:["属于计算瓶颈的类型","属于访存瓶颈的类型","属于延迟瓶颈的类型","已经接近硬件极限"],c:1,
+  e:"A 行 B 列被反复从全局读、复用为零,算术强度极低 → 访存瓶颈。tiling 正是为此。"},
+ {q:"tiling 用 shared memory 复用后,kernel 在 roofline 图上如何移动?",
+  a:["向左移更偏访存侧","向右移更偏计算侧","原地不动无变化","向下越过了屋顶"],c:1,
+  e:"复用降低全局访存(分母),算术强度升高 → 右移,从访存瓶颈走向计算瓶颈。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——bank=(地址/4)%32;访存瓶颈看复用;roofline 右移=访存量降。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

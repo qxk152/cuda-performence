@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 03 · 访存合并:带宽的开关</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem; font-size:19px;}
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:#1e1e1e; color:#e0e0e0; padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.78rem; line-height:1.55; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0; color:inherit;}
+  pre .kw{color:#569cd6;} pre .fn{color:#dcdcaa;} pre .num{color:#b5cea8;} pre .cm{color:#6a9955;} pre .hi{color:#f7d56a;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent); color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+  .mem{font-family:"SF Mono",Menlo,monospace; font-size:.8rem; line-height:1.8; margin:1rem 0;}
+  .cell{display:inline-block; width:1.7rem; text-align:center; border:1px solid var(--rule); margin:1px;}
+  .t0{background:#d8ecd8;} .t1{background:#cfe3f5;} .t2{background:#f7e0c0;} .t3{background:#f3d0d0;}
+  .miss{background:#eee; color:#aaa;}
+</style>
+</head>
+<body>
+
+<h1>访存合并:带宽的开关</h1>
+<p class="sub">Lesson 03 · CUDA 性能调优 · 访存瓶颈的头号武器</p>
+
+<p class="lead">你已经能判断一个 kernel 是访存瓶颈了。现在的问题是:<mark>同样搬一样多的数据,为什么有的 kernel 带宽利用 90%,有的只有 15%?</mark>
+最常见的答案是<strong>访存合并(coalescing)</strong>。这一节,你将第一次真正动手把一个 kernel 改快。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 你能看出一个 kernel 的访存是否<strong>合并</strong>,
+理解 warp 与 128 字节事务的关系,并知道如何把"跨步访问"改成"合并访问"。
+</div>
+
+<h2>1. 关键事实:GPU 按 warp、按整块搬数据</h2>
+
+<p>GPU 不是一个线程一个线程地读显存。它以 <strong>warp(32 个线程)</strong> 为单位执行,
+而显存访问以 <strong>固定大小的事务(transaction)</strong> 为单位——通常是 <mark>128 字节</mark>对齐的一段。<span class="cite">[1]</span></p>
+
+<p>当一个 warp 的 32 个线程同时读内存时,硬件会看它们的地址:</p>
+
+<ul>
+<li>如果 32 个地址<strong>恰好落在连续的一段</strong>(线程 i 读第 i 个 float)——
+硬件用 <strong>少数几个 128B 事务</strong>就全搬回来了。这叫 <strong>合并访问</strong>。</li>
+<li>如果 32 个地址<strong>东一个西一个</strong>——硬件被迫发<strong>很多个</strong>事务,
+每个只用到一点点,大量带宽浪费在没用的字节上。这叫 <strong>非合并访问</strong>。</li>
+</ul>
+
+<h2>2. 看图:同一个 warp,两种命运</h2>
+
+<p>设每个线程读一个 4 字节 float,一个 warp 32 线程,一次能用一个 128B 事务全部覆盖(32×4=128)。</p>
+
+<h3>✅ 合并:thread i 读 data[i]</h3>
+<div class="mem">
+addr: <span class="cell t0">0</span><span class="cell t0">4</span><span class="cell t0">8</span><span class="cell t0">12</span><span class="cell t0">…</span><span class="cell t0">124</span><br>
+<span style="color:#2d4a2d">→ 32 线程落在同一个 128B 段 → <strong>1 个事务</strong>,100% 字节有用</span>
+</div>
+
+<h3>❌ 非合并:thread i 读 data[i * stride]</h3>
+<div class="mem">
+事务1 <span class="cell t0">t0</span><span class="cell miss">·</span><span class="cell miss">·</span><span class="cell miss">·</span>
+事务2 <span class="cell t1">t1</span><span class="cell miss">·</span><span class="cell miss">·</span><span class="cell miss">·</span>
+事务3 <span class="cell t2">t2</span><span class="cell miss">·</span>…<br>
+<span style="color:#7a2d2d">→ 每个线程独占一个事务 → <strong>最多 32 个事务</strong>,大部分字节白搬</span>
+</div>
+
+<p>同样是读 32 个数,合并访问 1 个事务搞定,非合并要 32 个——<mark>带宽有效利用率可能差 10 倍以上</mark>。
+这就是为什么访存瓶颈的 kernel,第一件事就是检查合并。<span class="cite">[1]</span></p>
+
+<h2>2.5 「事务」到底是什么</h2>
+
+<p>合并的一切都绕着"事务"这个词。说透它:<mark>GPU 读显存不是一个字节一个字节读,而是一整块一整块读。那一块就是一次事务。</mark></p>
+
+<blockquote>
+打个比方:去仓库取货,规定<strong>每次必须开一整个货箱</strong>,哪怕你只要箱里一颗螺丝。
+货箱 = 事务。A100 上货箱固定 <strong>32 字节</strong>(一个 sector),硬件常把 4 个凑成 <strong>128 字节</strong>一起处理。
+</blockquote>
+
+<p>为什么这样设计?显存(HBM)的物理特性:<strong>按大块读极快,按零散小块读极慢</strong>——和机械硬盘顺序读快、随机读慢同理。
+所以硬件干脆规定:不管你要几个字节,都按固定大小的块搬。</p>
+
+<p>关键就在一句:<strong>一次事务搬回 128 字节,但其中有多少是你真正要用的?</strong></p>
+
+<table>
+<tr><th>情况</th><th>开几个货箱</th><th>有效利用</th></tr>
+<tr><td><strong>合并</strong>:32 线程的数据挤在一个 128B 块里</td><td>1 次事务</td><td>128/128 = 100% ✅</td></tr>
+<tr><td><strong>非合并</strong>:32 线程数据分散(stride)</td><td>最多 32 次事务</td><td>每箱只用 4B,4/128 ≈ 3% ❌</td></tr>
+</table>
+
+<p>同样取 128 字节有用数据,合并开 1 个箱,非合并开 32 个箱。带宽是固定的"开箱速度",
+<mark>非合并白白浪费 31/32 的箱子</mark>——这就是"差 10 倍以上"的来源。</p>
+
+<div class="keypt">
+<strong>把报告里的指标对上号:</strong>
+<code>request</code>(请求)= 一个 warp 的一条访存指令(它要的那 128B);
+<code>sector</code> = 32B 的货箱。<br>
+完全合并 → 128÷32 = <strong>4 sectors per request</strong>(理想);
+完全分散 → 每线程拖一个 = <strong>32 sectors per request</strong>(最糟)。
+所以这个数<strong>越接近 4 越好,越大越不合并</strong>。
+</div>
+
+<h2>3. 代码:一个经典的"踩坑→修复"</h2>
+
+<p>最常见的非合并来自<strong>按行处理矩阵</strong>。假设一个 M×N 矩阵按行主序存放,让每个线程处理一整列求和:</p>
+
+<h3>❌ 慢:每个线程沿列走,相邻线程地址相隔 N</h3>
+<pre><code><span class="cm">// thread t 处理第 t 列;一个 warp 的 32 个线程</span>
+<span class="cm">// 同一时刻访问 data[0*N+t], data[0*N+t+1]... 看似连续?</span>
+<span class="cm">// 但下一步它们一起跳到 row=1: 地址各 +N → 跨步!</span>
+<span class="kw">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;
+<span class="kw">float</span> sum = <span class="num">0</span>;
+<span class="kw">for</span> (<span class="kw">int</span> row = <span class="num">0</span>; row < N; row++)
+    sum += data[row * N + col];   <span class="hi">// 每轮 warp 内连续 ✓,但…见下</span></code></pre>
+
+<p>其实<strong>这一版反而是合并的</strong>!同一轮里,warp 的线程 t 读 <code>row*N + t</code>,
+地址连续。<mark>真正的坑是反过来写</mark>:</p>
+
+<h3>❌ 真正的坑:每个线程处理一行</h3>
+<pre><code><span class="kw">int</span> row = blockIdx.x * blockDim.x + threadIdx.x;
+<span class="kw">float</span> sum = <span class="num">0</span>;
+<span class="kw">for</span> (<span class="kw">int</span> c = <span class="num">0</span>; c < N; c++)
+    sum += data[row * N + c];     <span class="hi">// warp 内线程地址相隔 N → 非合并!</span></code></pre>
+
+<p>这里同一轮里线程 t 读 <code>t*N + c</code>,相邻线程地址差 <code>N</code>(一整行),完全分散。
+修复方法是<strong>让相邻线程访问相邻地址</strong>:换数据布局(转置)、或换线程到数据的映射方式。</p>
+
+<div class="keypt">
+<strong>判断口诀:</strong> 盯住 warp 内<em>相邻</em>线程(threadIdx.x 相差 1)在<em>同一条指令</em>里访问的地址。
+<strong>地址相差 1 个元素 → 合并</strong>;<strong>相差一个大 stride → 非合并</strong>。
+索引里 <code>threadIdx.x</code> 应当乘在<mark>最低维(变化最快的维)</mark>上。
+</div>
+
+<h2>4. 在报告里怎么看出来</h2>
+<p>非合并访问在 Nsight Compute 里有明确信号。除了 <a href="0002-reading-speed-of-light.html">SOL</a> 显示访存瓶颈外,
+Memory Workload Analysis 段会出现:</p>
+<pre><code><span class="hi">[Warning]</span> Uncoalesced global accesses. The memory access
+pattern has low efficiency. <span class="num">X</span> sectors per request 。</code></pre>
+<p>看 <strong>sectors per request</strong>(上一节已解释:理想≈4,越大越不合并)。
+如果是 16、32,就说明严重不合并——每个请求拖回一堆没用的 sector。<span class="cite">[1]</span></p>
+
+<h2>4.5 延伸一:对齐(alignment)</h2>
+
+<p>"合并的 warp 开 1 个事务"有个隐藏前提:<mark>起始地址要对齐到事务边界</mark>。
+128B 事务只能从 0、128、256… 这些 128 的倍数开始——把显存想成划好格子的货架,
+<strong>事务只能整格取,不能跨格错位取</strong>。</p>
+
+<p>于是即使数据完全连续、索引完美,只要<strong>起点偏了</strong>,事务数也会翻倍:</p>
+
+<table>
+<tr><th>warp 要的 128B 区间</th><th>跨几格</th><th>事务数</th></tr>
+<tr><td><code>[0, 128)</code> 对齐</td><td>1 格</td><td>1 ✅</td></tr>
+<tr><td><code>[32, 160)</code> 偏了 32B</td><td>横跨 2 格</td><td>2 ❌(各有浪费)</td></tr>
+</table>
+
+<ul>
+<li><strong>最常见来源</strong>:非零偏移,如 <code>kernel(data + 1, ...)</code>,或结构体字段没对齐。</li>
+<li><strong>CUDA 的保护</strong>:<code>cudaMalloc</code> 返回的指针保证至少 256B 对齐,从数组开头规矩访问通常没事。坑出在手动加偏移、自管内存时。</li>
+<li><strong>修复</strong>:用对齐分配、避免奇怪偏移;向量类型 <code>float4</code>(16B)天然带对齐;必要时 <code>__align__(128)</code>。<span class="cite">[1]</span></li>
+</ul>
+
+<div class="keypt">
+合并要求"相邻线程读相邻地址";<strong>对齐额外要求"这一段的起点踩在事务边界上"</strong>。
+两个都满足,才真正 1 个事务。
+</div>
+
+<h2>4.6 延伸二:L1 / L2 缓存如何补救非合并</h2>
+
+<p>前面把模型简化成"warp 直接读显存"。真相是中间隔着两层片上缓存:</p>
+
+<pre><code>warp 访存请求
+   ↓
+<span class="hi">L1</span>(每 SM 一个,A100 上与 shared memory 共用 SRAM)
+   ↓ miss
+<span class="hi">L2</span>(全 GPU 共享,A100 有 40MB,很大)
+   ↓ miss
+<span class="hi">HBM</span> 显存(真正的"远路")</code></pre>
+
+<p>关键:<mark>事务发生在缓存这一层,不一定直达 HBM。</mark>两个后果:</p>
+
+<h3>后果 1:L2 能摊销部分非合并的代价</h3>
+<p>非合并、地址分散,但数据若<strong>之前被读过、还在 L2 里</strong>,这次就不必走 HBM。</p>
+<ul>
+<li>非合并 <strong>+ 缓存命中</strong> → 没那么惨,L2 带宽远高于 HBM。</li>
+<li>非合并 <strong>+ 缓存未命中</strong> → 全额惩罚,每个分散访问拖一趟 HBM,最慢。</li>
+</ul>
+<p>这解释了一个困惑:<em>同样非合并的代码,为何有时慢得要死、有时还能忍?</em>
+取决于数据是否恰好被缓存住。A100 的 40MB L2 常能兜住一部分。</p>
+
+<h3>后果 2:这正是报告分两层指标的原因</h3>
+<p>回想 <a href="0002-reading-speed-of-light.html">第 2 节</a>那两行,现在能读出差异含义:</p>
+<table>
+<tr><th>Memory %</th><th>DRAM %</th><th>含义</th></tr>
+<tr><td>高</td><td>高</td><td>真在猛读显存,缓存没兜住 → 典型访存瓶颈</td></tr>
+<tr><td>高</td><td>低</td><td>流量多被 L2 接住 → 瓶颈在缓存/数据复用,不在 HBM</td></tr>
+</table>
+<p>这是判断"该优化访存模式,还是该优化数据复用(下一课 shared memory)"的关键线索。</p>
+
+<blockquote>
+<strong>别依赖缓存救场。</strong> 数据在不在缓存里是不可控的运气,取决于运行时历史。
+正确做法仍是从一开始就写合并访问——缓存是安全网,不是设计依据。
+数据集变大、缓存装不下时,寄希望于"L2 会兜住"一定会崩。
+</blockquote>
+
+<h2>5. 练习:这段访存合并吗?</h2>
+<p>每题盯住 warp 内相邻线程(<code>threadIdx.x</code> 差 1)的地址差。点选项看反馈。</p>
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 随时问我。</strong> 为什么是 128 字节?二维 blockIdx 怎么算合并?转置具体怎么改?
+把 kernel 贴给我,我帮你逐行看访存模式。我是你的老师。
+</div>
+
+<h2>主源推荐(本节精读)</h2>
+<p>📘 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">CUDA C++ Best Practices Guide — Coalesced Access to Global Memory</a>
+——这一小节用图解讲透了合并规则,是本节最高信任的来源,务必读一遍。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">NVIDIA, CUDA C++ Best Practices Guide — Coalesced Access</a></p>
+<p><strong>本节关联</strong>:
+上一节 → <a href="0002-reading-speed-of-light.html">Lesson 02 · 读报告</a> ·
+Roofline → <a href="0001-roofline-mental-model.html">Lesson 01</a> ·
+速查卡 → <a href="../reference/roofline-cheatsheet.html">速查表</a></p>
+<p><strong>下一节预告</strong>:Shared memory——当数据要被反复读时,把它搬进片上高速缓存,绕开显存带宽。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"int i=blockIdx.x*blockDim.x+threadIdx.x; y[i]=x[i]; —— 这段访存:",
+  a:["属于合并访问的内存模式","属于非合并的内存模式","属于部分合并的模式","无法依据此判断出来"],c:0,
+  e:"相邻线程 i 相差 1,x[i]/y[i] 地址相差 1 个元素 → 完美合并。这是最理想的 1D 模式。"},
+ {q:"int i=...; sum+=data[i*32]; (warp 内相邻线程) —— 这段访存:",
+  a:["属于合并访问的内存模式","属于非合并的内存模式","属于部分合并的模式","无法依据此判断出来"],c:1,
+  e:"相邻线程地址相差 32 个元素(128 字节),完全分散 → 非合并,每线程一个事务。"},
+ {q:"行主序矩阵 a[row][col],令 col=threadIdx.x,访问 a[row*N+col] —— ",
+  a:["属于合并访问的内存模式","属于非合并的内存模式","属于部分合并的模式","无法依据此判断出来"],c:0,
+  e:"threadIdx.x 乘在最低维 col 上,相邻线程地址差 1 → 合并。这是正确写法。"},
+ {q:"行主序矩阵,令 row=threadIdx.x,访问 a[row*N+col] —— ",
+  a:["属于合并访问的内存模式","属于非合并的内存模式","属于部分合并的模式","无法依据此判断出来"],c:1,
+  e:"threadIdx.x 乘在高维 row 上,相邻线程地址差 N(一整行)→ 非合并。需转置或换映射。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 盯住相邻线程(threadIdx.x 差 1)的地址差是 1 还是一个大 stride。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

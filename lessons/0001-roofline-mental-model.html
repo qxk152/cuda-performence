@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 01 · Roofline:先判断瓶颈,再谈优化</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --paper:#fdfdf9; --rule:#d8d4c5;
+    --accent:#7a2d2d; --muted:#6b6b63; --hl:#fbf3d0; --code:#f2efe4;
+  }
+  *{box-sizing:border-box}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+    line-height:1.62; max-width:42rem; margin:0 auto; padding:3rem 1.5rem 6rem;
+    font-size:19px; -webkit-font-smoothing:antialiased;
+  }
+  h1{font-size:1.9rem; line-height:1.2; margin:0 0 .2rem; font-weight:600;}
+  .sub{color:var(--muted); font-style:italic; margin:0 0 2rem; font-size:1.05rem;}
+  h2{font-size:1.25rem; margin:2.6rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem;}
+  h3{font-size:1.05rem; margin:1.6rem 0 .4rem; color:var(--accent);}
+  p{margin:.7rem 0;}
+  code{background:var(--code); padding:.08em .35em; border-radius:3px; font-size:.85em;
+    font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:var(--code); padding:1rem 1.2rem; border-radius:6px; overflow-x:auto;
+    font-size:.8rem; line-height:1.5; border-left:3px solid var(--accent);}
+  pre code{background:none; padding:0;}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid var(--rule);}
+  a:hover{border-bottom-color:var(--accent);}
+  blockquote{margin:1.2rem 0; padding:.4rem 0 .4rem 1.2rem; border-left:3px solid var(--accent);
+    color:var(--muted); font-style:italic;}
+  mark{background:var(--hl); padding:0 .15em;}
+  .lead{font-size:1.08rem;}
+  .keypt{background:var(--hl); border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0;}
+  .keypt strong{color:var(--accent);}
+  figure{margin:2rem 0; text-align:center;}
+  figcaption{font-size:.8rem; color:var(--muted); font-style:italic; margin-top:.5rem;}
+  .cite{font-size:.78rem; color:var(--muted); vertical-align:super;}
+  table{border-collapse:collapse; width:100%; margin:1.2rem 0; font-size:.9rem;}
+  th,td{border-bottom:1px solid var(--rule); padding:.45rem .6rem; text-align:left;}
+  th{color:var(--accent); font-weight:600;}
+  .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule);
+    font-size:.85rem; color:var(--muted);}
+  .footer a{color:var(--muted);}
+  .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0;
+    font-size:.92rem; border-left:3px solid #4a6b4a;}
+</style>
+</head>
+<body>
+
+<h1>Roofline:先判断瓶颈,再谈优化</h1>
+<p class="sub">Lesson 01 · CUDA 性能调优 · 建立核心心智模型</p>
+
+<p class="lead">调优一个慢 kernel 时,新手最常犯的错误是:<mark>凭直觉乱优化</mark>。
+加 shared memory、调 block 大小、展开循环……结果性能纹丝不动。
+原因是:每个 kernel 都被某一种资源卡住,而你优化了<em>另一种</em>资源。
+本节你将掌握调优的第一性原理——<strong>先判断瓶颈类型,再动手</strong>。</p>
+
+<div class="keypt">
+<strong>本节目标(一个可带走的胜利):</strong> 给定一个 kernel 的「算术强度」和你的 GPU 规格,
+你能判断它是 <strong>访存瓶颈(memory-bound)</strong> 还是 <strong>计算瓶颈(compute-bound)</strong>,
+从而知道<em>该往哪个方向优化</em>。
+</div>
+
+<h2>1. 两堵墙:每个 kernel 都撞其中一堵</h2>
+
+<p>一个 GPU kernel 要干两件事:<strong>搬数据</strong>(从显存读写)和 <strong>算数据</strong>(在 SM 上做浮点/整数运算)。
+GPU 的这两种能力是分开的、各有上限:</p>
+
+<ul>
+<li><strong>计算上限</strong>:峰值算力,单位 FLOP/s(每秒浮点运算次数)。</li>
+<li><strong>访存上限</strong>:显存带宽,单位 Byte/s(每秒能搬多少字节)。</li>
+</ul>
+
+<p>关键洞察:这两件事<mark>同时进行、互相重叠</mark>。kernel 的实际耗时,取决于哪一件先做不完——
+那就是它的<strong>瓶颈</strong>。优化非瓶颈的那一边,总耗时不会变。</p>
+
+<blockquote>
+就像水管接水:水龙头流量(带宽)和水桶大小(算力)决定接满一桶水的时间。
+如果水龙头细,你换个更大的桶毫无意义——你是「带宽瓶颈」。
+</blockquote>
+
+<h2>2. 算术强度:决定瓶颈的那个比值</h2>
+
+<p>怎么知道一个 kernel 撞哪堵墙?看它的 <strong>算术强度(Arithmetic Intensity, AI)</strong>:</p>
+
+<div class="keypt">
+<strong>算术强度 = 总计算量 ÷ 总访存量 = FLOPs / Bytes</strong><br>
+「每从显存搬 1 个字节,我能做多少次浮点运算?」
+</div>
+
+<p>这个比值是 kernel 自身的<em>算法属性</em>,和 GPU 无关。举两个 AI 里的典型例子:</p>
+
+<table>
+<tr><th>算子</th><th>特征</th><th>算术强度</th></tr>
+<tr><td>逐元素加法 <code>c = a + b</code></td><td>读 8 字节,算 1 次</td><td>极低(≈0.125)</td></tr>
+<tr><td>大矩阵乘 GEMM</td><td>每个元素被复用 N 次</td><td>高(可达几十~上百)</td></tr>
+</table>
+
+<p>这解释了一个 AI 工程师天天遇到的现象:<mark>逐元素算子、归一化、softmax 几乎总是访存瓶颈,
+而大矩阵乘才有机会成为计算瓶颈。</mark><span class="cite">[1]</span></p>
+
+<h2>3. Roofline 图:把两堵墙画出来</h2>
+
+<p>把算术强度放横轴、可达性能放纵轴,就得到 <strong>Roofline 图</strong>——一张能一眼看出瓶颈的图:</p>
+
+<pre><code>性能 (FLOP/s)
+  ▲
+峰值算力 ┤        ___________________  ← 计算屋顶(水平线)
+        │       /
+        │      /  ← 访存屋顶(斜线,斜率=带宽)
+        │     /
+        │    /        memory-bound │ compute-bound
+        │   /                      │
+        │  /                       │
+        └─┴──────────────────────────────────▶ 算术强度 (FLOP/Byte)
+                    ↑ ridge point(脊点)</code></pre>
+
+<ul>
+<li><strong>斜线</strong>(访存屋顶):性能 = 带宽 × 算术强度。强度越低越靠左,越受带宽限制。</li>
+<li><strong>水平线</strong>(计算屋顶):峰值算力,封顶。</li>
+<li><strong>脊点(ridge point)</strong>:两线交点。它的横坐标 = <code>峰值算力 ÷ 带宽</code>。</li>
+</ul>
+
+<div class="keypt">
+判断法则:把 kernel 的算术强度和脊点比较——<br>
+<strong>AI &lt; 脊点 → 访存瓶颈</strong>(在斜线下方,优化访存)<br>
+<strong>AI &gt; 脊点 → 计算瓶颈</strong>(在水平线下方,优化计算)
+</div>
+
+<p>现代数据中心卡的脊点高得吓人。例如 A100:峰值 FP32 约 19.5 TFLOP/s,带宽约 1.5 TB/s,
+脊点 ≈ 13 FLOP/Byte。<span class="cite">[1]</span> 这意味着<mark>绝大多数 AI 算子都落在斜线左侧——访存瓶颈</mark>。
+这就是为什么「访存优化」是 CUDA 调优的重头戏。</p>
+
+<h2>4. 练习:判断瓶颈(动手回忆)</h2>
+
+<p>下面 4 道题不要看上文,凭记忆判断。点选项立刻看反馈。
+<em>假设 GPU 脊点 = 13 FLOP/Byte。</em></p>
+
+<div id="quiz"></div>
+
+<div class="ask">
+<strong>💬 卡住了就问我。</strong> 我是你的老师——算术强度怎么手算?你的卡脊点是多少?
+某个 AI 算子到底算哪类?随时追问,把不清楚的地方挖透。
+</div>
+
+<h2>5. 动手:在你自己的卡上验证(可选)</h2>
+
+<p>你有数据中心卡,强烈建议做这一步,把抽象变具体。用 Nsight Compute 跑任意一个 kernel:</p>
+
+<pre><code># 编译你的程序后,用 ncu 抓 Speed of Light 段
+ncu --section SpeedOfLight ./your_program
+
+# 报告里看这两行:
+#   Compute (SM) Throughput  →  计算利用率
+#   Memory Throughput        →  访存利用率
+# 哪个接近 100%,就是哪个瓶颈。</code></pre>
+
+<p>Nsight Compute 的 <strong>Speed of Light</strong> 段其实就是 roofline 的自动化版本:它直接告诉你 kernel
+贴着哪堵墙。<span class="cite">[2]</span> 下一节我们会专门拆解怎么读这份报告。</p>
+
+<h2>主源推荐(本节精读 / 必看)</h2>
+<p>📘 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">CUDA C++ Best Practices Guide</a>
+——调优的权威圣经。本节相关的是开头的「Assess(评估)」与「Memory Optimizations」章节,
+核心思想就是:<em>先测量定位瓶颈,再优化</em>。这是你接下来反复回看的第一资源。</p>
+
+<div class="footer">
+<p><strong>引用</strong><br>
+[1] <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">NVIDIA, CUDA C++ Best Practices Guide</a><br>
+[2] <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide">NVIDIA, Nsight Compute Profiling Guide — Speed of Light</a></p>
+<p><strong>本节关联</strong>:
+参考卡 → <a href="../reference/roofline-cheatsheet.html">Roofline 速查表</a> ·
+任务 → <a href="../MISSION.md">Mission</a> ·
+全部资源 → <a href="../RESOURCES.md">Resources</a></p>
+<p><strong>下一节预告</strong>:用 Nsight Compute 读 Speed of Light 报告,把 roofline 落到真实数字上。</p>
+</div>
+
+<script>
+const Q=[
+ {q:"逐元素加法 c=a+b(float),算术强度极低。它是哪类瓶颈?",
+  a:["这是一个访存瓶颈的算子","这是一个计算瓶颈的算子","这两者它都不是瓶颈","需更多信息才可判断"],c:0,
+  e:"强度≈0.125 远小于脊点13,落在斜线左侧,访存瓶颈。优化方向是减少访存、提高带宽利用。"},
+ {q:"一个 kernel 算术强度=40,GPU 脊点=13。它是哪类瓶颈?",
+  a:["这是一个访存瓶颈的算子","这是一个计算瓶颈的算子","这两者它都不是瓶颈","需更多信息才可判断"],c:1,
+  e:"40 > 13,落在水平线下方,计算瓶颈。此时优化访存无用,要提高计算效率。"},
+ {q:"给 memory-bound 的 kernel 加循环展开提升计算,性能会怎样?",
+  a:["性能会有大幅度的提升","总耗时几乎不会变化","性能反而会明显下降","会直接超过峰值算力"],c:1,
+  e:"瓶颈在访存,优化计算这条非瓶颈边,总耗时不变。这是新手最常踩的坑。"},
+ {q:"脊点的横坐标由什么决定?",
+  a:["由峰值算力除以带宽","由总线程数量决定","由共享内存大小决定","由网格的维度决定"],c:0,
+  e:"脊点 = 峰值算力 ÷ 带宽,是斜线与水平线的交点,纯由硬件规格决定。"}
+];
+const box=document.getElementById('quiz');
+Q.forEach((item,i)=>{
+ const d=document.createElement('div');
+ d.style.cssText='margin:1.3rem 0;padding:1rem 1.2rem;background:#f7f5ec;border-radius:6px;';
+ let h='<p style="margin:.2rem 0 .7rem;font-weight:600">Q'+(i+1)+'. '+item.q+'</p>';
+ item.a.forEach((opt,j)=>{h+='<button data-q="'+i+'" data-o="'+j+'" style="display:block;width:100%;text-align:left;margin:.3rem 0;padding:.5rem .8rem;border:1px solid #d8d4c5;background:#fff;border-radius:4px;cursor:pointer;font:inherit;font-size:.88rem">'+opt+'</button>';});
+ h+='<p class="fb" style="margin:.6rem 0 0;font-size:.85rem;min-height:1px"></p>';
+ d.innerHTML=h; box.appendChild(d);
+});
+box.addEventListener('click',e=>{
+ const b=e.target.closest('button'); if(!b)return;
+ const i=+b.dataset.q, o=+b.dataset.o, item=Q[i];
+ const wrap=b.parentElement, fb=wrap.querySelector('.fb');
+ wrap.querySelectorAll('button').forEach(x=>{x.style.background='#fff';x.style.borderColor='#d8d4c5';});
+ if(o===item.c){b.style.background='#d8ecd8';b.style.borderColor='#4a6b4a';
+   fb.innerHTML='✅ <strong>对。</strong> '+item.e;fb.style.color='#2d4a2d';}
+ else{b.style.background='#f3d8d8';b.style.borderColor='#7a2d2d';
+   fb.innerHTML='❌ 再想想——回忆脊点法则。';fb.style.color='#7a2d2d';}
+});
+</script>
+
+</body>
+</html>

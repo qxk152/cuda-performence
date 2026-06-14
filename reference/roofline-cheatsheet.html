@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>速查 · Roofline 与瓶颈判断</title>
+<style>
+  :root{--ink:#1a1a1a;--paper:#fff;--rule:#ccc;--accent:#7a2d2d;--muted:#666;--code:#f2efe4;--hl:#fbf3d0;}
+  *{box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:"Iowan Old Style",Palatino,Georgia,serif;
+    max-width:46rem;margin:0 auto;padding:2rem 1.4rem 4rem;line-height:1.5;font-size:16px;}
+  h1{font-size:1.5rem;margin:0 0 .3rem;}
+  .sub{color:var(--muted);font-style:italic;margin:0 0 1.5rem;font-size:.9rem;}
+  h2{font-size:1.05rem;color:var(--accent);border-bottom:1px solid var(--rule);padding-bottom:.2rem;margin:1.8rem 0 .6rem;}
+  code{background:var(--code);padding:.05em .3em;border-radius:3px;font-family:"SF Mono",Menlo,monospace;font-size:.85em;}
+  table{border-collapse:collapse;width:100%;margin:.6rem 0;font-size:.85rem;}
+  th,td{border:1px solid var(--rule);padding:.4rem .6rem;text-align:left;vertical-align:top;}
+  th{background:#f7f5ec;color:var(--accent);}
+  .box{background:var(--hl);border-radius:5px;padding:.7rem 1rem;margin:.8rem 0;font-size:.9rem;}
+  .box strong{color:var(--accent);}
+  a{color:var(--accent);}
+  ul{margin:.4rem 0;padding-left:1.3rem;}
+  li{margin:.2rem 0;}
+  @media print{body{font-size:12px;} a{color:var(--ink);text-decoration:none;}}
+</style>
+</head>
+<body>
+
+<h1>Roofline 与瓶颈判断 · 速查表</h1>
+<p class="sub">CUDA 性能调优 · 快速参考 · 配合 <a href="../lessons/0001-roofline-mental-model.html">Lesson 01</a></p>
+
+<h2>访存合并(Coalescing)速记</h2>
+<div class="box">
+<strong>事务(transaction):</strong> 显存按固定大小块搬运的最小单位。A100 上 1 个 sector = 32B,常 4 个凑成 128B 一起处理。<strong>不管你要几字节,都按整块搬</strong>——非合并 = 开很多箱却每箱只用一点。
+</div>
+<div class="box">
+<strong>规则:</strong> warp(32 线程)的访存按 128B 对齐事务进行。让 warp 内<strong>相邻线程访问相邻地址</strong>,即 <code>threadIdx.x</code> 乘在数据的<strong>最低维</strong>上。
+</div>
+<table>
+<tr><th>索引模式(warp 内相邻线程)</th><th>地址差</th><th>是否合并</th></tr>
+<tr><td><code>x[i]</code>, i=tid</td><td>1 元素</td><td>✅ 合并</td></tr>
+<tr><td><code>x[i*stride]</code></td><td>stride 元素</td><td>❌ 非合并</td></tr>
+<tr><td>行主序 <code>a[row*N+col]</code>, col=tid.x</td><td>1 元素</td><td>✅ 合并</td></tr>
+<tr><td>行主序 <code>a[row*N+col]</code>, row=tid.x</td><td>N 元素</td><td>❌ 非合并</td></tr>
+</table>
+<table>
+<tr><th>术语</th><th>含义</th></tr>
+<tr><td>request</td><td>一个 warp 的一条访存指令</td></tr>
+<tr><td>sector</td><td>32B 货箱;sectors/request 理想≈4,越大越不合并</td></tr>
+</table>
+<ul>
+<li>Nsight 信号:Memory Workload 段 "Uncoalesced global accesses";看 <strong>sectors per request</strong>(理想≈4,越大越糟)。</li>
+<li>修复:转置数据布局、调整线程↔数据映射、或向量化(<code>float4</code>)。</li>
+</ul>
+<div class="box">
+<strong>列访问(stride=N)正解:</strong> 不要硬改访问模式 —— <strong>先用一次按行的合并访问把 tile 搬进 shared,再在片上按列读</strong>。shared 不怕 stride(只提防 bank conflict)。这正是 tiling 的动机。
+</div>
+<div class="box">
+<strong>对齐(alignment):</strong> 128B 事务只能从 128 的倍数地址起。数据再连续,若起点偏移(如 <code>data+1</code>、未对齐字段)→ 跨格 → 事务翻倍。<code>cudaMalloc</code> 保证 ≥256B 对齐;<code>float4</code> 天然对齐;必要时 <code>__align__(128)</code>。
+</div>
+<table>
+<tr><th>缓存层级(A100)</th><th>作用</th></tr>
+<tr><td>L1(每 SM,与 shared mem 共用)</td><td>最快,容量小</td></tr>
+<tr><td>L2(全 GPU 共享,40MB)</td><td>能摊销部分非合并/重复访问</td></tr>
+<tr><td>HBM 显存</td><td>真正的"远路",带宽即峰值带宽</td></tr>
+</table>
+<ul>
+<li><strong>Memory% 高 + DRAM% 高</strong> → 真打 HBM,缓存没兜住。</li>
+<li><strong>Memory% 高 + DRAM% 低</strong> → 多被 L2 接住,瓶颈在数据复用 → 考虑 shared memory。</li>
+<li>⚠️ 别依赖缓存救场——能否命中不可控。仍应一开始就写合并访问。</li>
+</ul>
+
+<h2>Shared Memory 速记</h2>
+<div class="box">
+<strong>何时用:</strong> 仅当数据<strong>被反复读</strong>(block 内多线程或单线程多次)。无复用(逐元素)→ 无益。有复用 → 全局读 1 次、shared 读 N 次,全局访存量降为 1/N,算术强度升高(roofline 右移)。
+</div>
+<div class="box">
+<strong>三步:</strong> ① <code>__shared__ float tile[N];</code> ② 协作加载(合并访问)→ <code>__syncthreads();</code> ③ 复用 tile。
+</div>
+<table>
+<tr><th>层级(A100)</th><th>延迟约</th><th>范围</th></tr>
+<tr><td>寄存器</td><td>~1 cyc</td><td>线程私有</td></tr>
+<tr><td>Shared(片上 SRAM,与 L1 共用)</td><td>~20-30 cyc</td><td>block 内共享,手动管理</td></tr>
+<tr><td>L2</td><td>~200 cyc</td><td>全 GPU,自动</td></tr>
+<tr><td>全局 HBM</td><td>~400-800 cyc</td><td>全部,自动</td></tr>
+</table>
+<ul>
+<li>⚠️ <code>__syncthreads()</code> 必须<strong>全 block 线程都到达</strong>;放进 if 分支只让部分线程执行 → <strong>死锁</strong>。</li>
+<li>⚠️ 写 shared 与读他人写的位置之间,<strong>必须</strong>有 <code>__syncthreads()</code>,否则读到垃圾值(且时隐时现)。</li>
+</ul>
+
+<h2>Bank Conflict 速记</h2>
+<div class="box">
+<strong>32 个 bank:</strong> shared memory 分 32 条通道。连续 4B 字依次落 bank 0..31。<code>bank = (地址/4) % 32</code>。一个 warp 内若多线程访问<strong>不同地址但同一 bank</strong> → 串行化,N 路冲突慢 N 倍。
+</div>
+<table>
+<tr><th>warp 访问模式</th><th>结果</th></tr>
+<tr><td><code>s[tid]</code> 连续字</td><td>32 不同 bank → ✅ 1 拍</td></tr>
+<tr><td><code>s[0]</code> 全员同址</td><td>broadcast → ✅ 不算冲突</td></tr>
+<tr><td><code>s[tid*32]</code> / 按列 <code>tile[tid][k]</code></td><td>全落 bank 0 → ❌ 32 路冲突</td></tr>
+</table>
+<ul>
+<li>修复:<strong>padding</strong> —— <code>tile[32][33]</code>(列宽+1,与 32 互质,打乱 bank 对齐)。</li>
+<li>Nsight 信号:Memory Workload 段 "Shared Memory Bank Conflicts" 非零。</li>
+</ul>
+
+<h2>Tiled 矩阵乘要点</h2>
+<div class="box">
+朴素 GEMM:A 行 B 列反复从全局读、零复用 → 访存瓶颈。<strong>Tiling</strong>:把 T×T 小块协作加载进 shared(合并)→ <code>__syncthreads()</code> → 在 shared 复用 T 次 → <code>__syncthreads()</code> → 下一块。全局访存降为约 1/T,算术强度升高,roofline 右移逼近峰值。padding As/Bs 防 bank conflict。
+</div>
+
+<h2>Occupancy 速记</h2>
+<div class="box">
+<strong>定义:</strong> 活跃 warp 数 ÷ SM 最大 warp 数(A100:64 warp = 2048 线程/SM)。衡量调度器有多少候选 warp 可切换来藏延迟。
+</div>
+<div class="box">
+<strong>铁律:</strong> 高不一定快(ILP 也能藏延迟,提它有代价如 register spilling);但<strong>过低一定伤性能</strong>。→ 保下限、不强求上限。只在「延迟瓶颈+occupancy 低」时才提。
+</div>
+<table>
+<tr><th>限制 occupancy 的资源</th><th>怎么卡住</th></tr>
+<tr><td>寄存器/线程</td><td>太多 → 装不下更多线程</td></tr>
+<tr><td>shared mem/block</td><td>太多 → 同驻 block 变少</td></tr>
+<tr><td>block 大小</td><td>太小 → 撞每 SM 最大 block 数</td></tr>
+</table>
+<ul>
+<li>block 大小取 32 倍数(常 128/256);grid ≥ SM 数。</li>
+<li><code>cudaOccupancyMaxPotentialBlockSize()</code> 让运行时推荐 block 大小。</li>
+<li>查寄存器用量:<code>nvcc -Xptxas -v</code>。Nsight 看理论 vs 实测 occupancy(差距大=负载不均/尾部效应)。</li>
+</ul>
+
+<h2>核心公式</h2>
+<table>
+<tr><th>量</th><th>公式</th><th>单位</th></tr>
+<tr><td>算术强度 AI</td><td><code>总 FLOPs ÷ 总 Bytes</code></td><td>FLOP/Byte</td></tr>
+<tr><td>访存屋顶</td><td><code>带宽 × AI</code></td><td>FLOP/s</td></tr>
+<tr><td>计算屋顶</td><td><code>峰值算力</code>(水平封顶)</td><td>FLOP/s</td></tr>
+<tr><td>脊点(ridge)</td><td><code>峰值算力 ÷ 带宽</code></td><td>FLOP/Byte</td></tr>
+</table>
+
+<div class="box">
+<strong>判断法则:</strong>
+把 kernel 的 AI 与脊点比较 ——
+<strong>AI &lt; 脊点 → 访存瓶颈</strong>(优化访存);
+<strong>AI &gt; 脊点 → 计算瓶颈</strong>(优化计算)。
+</div>
+
+<h2>瓶颈 → 优化方向</h2>
+<table>
+<tr><th>瓶颈类型</th><th>症状(Nsight)</th><th>优化手段</th></tr>
+<tr><td>访存瓶颈<br>memory-bound</td><td>Memory Throughput 高、SM 低</td>
+<td>访存合并、用 shared memory 复用、减少冗余读写、提高带宽利用、向量化访存(float4)</td></tr>
+<tr><td>计算瓶颈<br>compute-bound</td><td>SM Throughput 高、Memory 低</td>
+<td>用更快指令、tensor core、减少计算量、提高 ILP、避免低吞吐指令</td></tr>
+<tr><td>两者都低<br>latency-bound</td><td>两个利用率都不高</td>
+<td>提高 occupancy / 并行度,藏延迟(更多 warp 或更多 ILP)</td></tr>
+</table>
+
+<h2>典型 AI 算子的算术强度</h2>
+<table>
+<tr><th>算子</th><th>强度</th><th>通常瓶颈</th></tr>
+<tr><td>逐元素(add/relu/scale)</td><td>极低 ≈0.1</td><td>访存</td></tr>
+<tr><td>归一化 / softmax</td><td>低</td><td>访存</td></tr>
+<tr><td>reduction(求和等)</td><td>低</td><td>访存</td></tr>
+<tr><td>小矩阵乘 / GEMV</td><td>中低</td><td>访存</td></tr>
+<tr><td>大矩阵乘 GEMM(已 tiling)</td><td>高 数十+</td><td>计算</td></tr>
+</table>
+
+<h2>常见数据中心卡脊点(FP32,约值)</h2>
+<table>
+<tr><th>卡</th><th>峰值 FP32</th><th>带宽</th><th>脊点</th></tr>
+<tr><td>V100</td><td>~15.7 TF</td><td>~0.9 TB/s</td><td>~17</td></tr>
+<tr><td>A100</td><td>~19.5 TF</td><td>~1.5 TB/s</td><td>~13</td></tr>
+<tr><td>H100 (SXM)</td><td>~67 TF</td><td>~3.35 TB/s</td><td>~20</td></tr>
+</table>
+<p style="font-size:.8rem;color:var(--muted)">注:tensor core / 低精度(FP16/BF16/TF32)峰值更高,脊点会显著右移,更易成为访存瓶颈。确认你的卡型号后核对官方 datasheet。</p>
+
+<h2>Nsight 速用</h2>
+<ul>
+<li>抓瓶颈:<code>ncu --section SpeedOfLight ./prog</code></li>
+<li>看 <code>Compute (SM) Throughput</code> vs <code>Memory Throughput</code>,谁高谁是瓶颈。</li>
+<li>详细访存分析:<code>ncu --section MemoryWorkloadAnalysis ./prog</code></li>
+</ul>
+
+<h2>调优铁律</h2>
+<div class="box">
+<strong>1.</strong> 永远先测量、定位瓶颈,再优化。<br>
+<strong>2.</strong> 只优化瓶颈那一边 —— 优化非瓶颈边,总耗时不变。<br>
+<strong>3.</strong> 优化后再测一遍,用数据确认提升。
+</div>
+
+<p style="font-size:.8rem;color:var(--muted);margin-top:2rem;border-top:1px solid var(--rule);padding-top:.8rem;">
+来源:<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">CUDA C++ Best Practices Guide</a> ·
+<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide">Nsight Compute Profiling Guide</a></p>
+
+</body>
+</html>
