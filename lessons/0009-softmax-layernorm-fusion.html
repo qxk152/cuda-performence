@@ -38,9 +38,18 @@
   .footer{margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--rule); font-size:.85rem; color:var(--muted);}
   .footer a{color:var(--muted);}
   .ask{background:#eef3ee; border-radius:6px; padding:.9rem 1.2rem; margin:2rem 0; font-size:.92rem; border-left:3px solid #4a6b4a;}
+
+  .nav-home{display:inline-flex; align-items:center; gap:.3rem; color:var(--accent);
+    font-size:.9rem; font-weight:500; text-decoration:none; border:none;
+    margin-bottom:1.5rem; padding:.3rem 0; transition:opacity .15s;}
+  .nav-home:hover{opacity:.7;}
+  .nav-home::before{content:'← ';}
+
 </style>
 </head>
 <body>
+
+<a class="nav-home" href="../index.html">返回首页</a>
 
 <h1>Softmax / LayerNorm 融合</h1>
 <p class="sub">Lesson 09 · CUDA 性能调优 · 把 reduction 与逐元素算子合成一个 kernel</p>
