@@ -61,8 +61,23 @@
 
 <div class="keypt">
 <strong>本节目标(一个可带走的胜利):</strong> 你能说清"reduction 的天花板是带宽不是算力",
-并掌握三级优化——<strong>块内 sequential addressing → warp shuffle → grid-stride 多元素</strong>,
-最后用 <code>ncu</code> 的 DRAM Throughput 验证你吃到了 A100 ~1.5–2.0 TB/s 的几成。
+并把它从朴素版一路优化到逼近 HBM 带宽极限。本节跟着配套代码 <code>code/0008-reduce.cu</code> 走
+<strong>六版调优阶梯(v0→v5)</strong>——每一刀只治一个病,逐版 benchmark 看加速比,
+最后用 <code>ncu</code> 的 DRAM Throughput 验证你吃到了带宽的几成。这条阶梯正是
+<a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf">Mark Harris reduce0→reduce7</a> 的标准路线。
+</div>
+
+<div class="keypt" style="background:#eef3ee;border-left:3px solid #4a6b4a">
+<strong>六版阶梯总览</strong>(对照 <code>code/0008-reduce.cu</code> 的六个 kernel):
+<table style="margin:.6rem 0 0">
+<tr><th>版本</th><th>动作</th><th>治的病</th></tr>
+<tr><td><code>v0</code></td><td>interleaved + 取模</td><td>baseline:warp 发散 + bank conflict</td></tr>
+<tr><td><code>v1</code></td><td>interleaved 去取模</td><td>治发散(bank conflict 仍在)</td></tr>
+<tr><td><code>v2</code></td><td>sequential addressing</td><td><strong>第一刀</strong>:一并治发散 + bank conflict</td></tr>
+<tr><td><code>v3</code></td><td>first-add-on-load</td><td>加载即相加,grid 减半</td></tr>
+<tr><td><code>v4</code></td><td>unroll last warp</td><td><strong>第二刀</strong>:最后一个 warp 走 shuffle</td></tr>
+<tr><td><code>v5</code></td><td>grid-stride 多元素</td><td><strong>第三刀</strong>:grid 与 N 解耦 + 摊薄开销</td></tr>
+</table>
 </div>
 
 <h2>1. 先定瓶颈:reduction 注定是访存瓶颈</h2>
@@ -80,7 +95,7 @@
 <code>N×4 / 带宽</code>。比如 N=2²⁸(1 GB),A100 ~1.8 TB/s → 下限约 <strong>0.55 ms</strong>。你的 kernel 离它多远,就是优化空间。
 </div>
 
-<h2>2. 朴素版:interleaved addressing(慢在哪)</h2>
+<h2>2. v0 朴素版:interleaved addressing(慢在哪)</h2>
 
 <p>经典写法:block 内每个线程搬一个元素进 shared,然后"树形"两两相加。第一版用<strong>交错寻址</strong>:</p>
 
@@ -91,7 +106,7 @@ sdata[tid] = g_in[blockIdx.x*BLOCK + tid];   <span class="cm">// 合并加载 �
 
 <span class="kw">for</span> (<span class="kw">int</span> s = <span class="num">1</span>; s < BLOCK; s *= <span class="num">2</span>) {
     <span class="kw">if</span> (tid % (<span class="num">2</span>*s) == <span class="num">0</span>)              <span class="hi">// ❌ 取模 → warp 内严重分支发散</span>
-        sdata[tid] += sdata[tid + s];
+        sdata[tid] += sdata[tid + s];        <span class="hi">// ❌ 跨步访问 → bank conflict</span>
     <span class="fn">__syncthreads</span>();
 }
 <span class="kw">if</span> (tid == <span class="num">0</span>) g_out[blockIdx.x] = sdata[<span class="num">0</span>];</code></pre>
@@ -100,7 +115,20 @@ sdata[tid] = g_in[blockIdx.x*BLOCK + tid];   <span class="cm">// 合并加载 �
 这正是<a href="0006-occupancy-and-launch-config.html">第 6 节</a>说的 warp 分支发散。
 <strong>(2) <code>sdata[tid+s]</code> 这种跨步访问,在 shared 里会撞 <a href="0005-bank-conflict-and-tiling.html">bank conflict</a></strong>。</p>
 
-<h2>3. 第一刀:sequential addressing(干掉发散与 bank conflict)</h2>
+<h3>v1:先只治发散(留着 bank conflict 当对照)</h3>
+
+<p>不动跨步访问,只把"取模筛线程"换成"把活跃线程压到 warp 前部":<code>index = 2*s*tid</code>。
+小步长时活跃 lane 在 warp 内连续 → <strong>不再发散</strong>;但 <code>sdata[index+s]</code> 仍是跨步 → <strong>bank conflict 没治</strong>。
+这一版单独存在,是为了让你在 benchmark 里看清"去发散"本身值多少。</p>
+
+<pre><code><span class="kw">for</span> (<span class="kw">int</span> s = <span class="num">1</span>; s < BLOCK; s *= <span class="num">2</span>) {
+    <span class="kw">int</span> index = <span class="num">2</span>*s*tid;                  <span class="hi">// ✅ 活跃线程连续 → 无发散</span>
+    <span class="kw">if</span> (index < BLOCK)
+        sdata[index] += sdata[index + s];   <span class="hi">// ❌ 仍跨步 → bank conflict</span>
+    <span class="fn">__syncthreads</span>();
+}</code></pre>
+
+<h2>3. v2 第一刀:sequential addressing(干掉发散与 bank conflict)</h2>
 
 <p>把循环反过来——<strong>从大步长往小走,让活跃线程永远是前一半连续的 tid</strong>:</p>
 
@@ -118,7 +146,22 @@ sdata[tid] = g_in[blockIdx.x*BLOCK + tid];   <span class="cm">// 合并加载 �
 也是"<mark>让一个 warp 内线程行为一致</mark>"这条通用直觉的最佳示范。
 </div>
 
-<h2>4. 第二刀:warp shuffle —— 最后 32 个线程不走 shared</h2>
+<h2>4. v3 加载即相加:first add during load</h2>
+
+<p>v2 的循环第一轮就有<strong>一半线程闲着</strong>(<code>s=BLOCK/2</code> 时只有前一半 tid 干活)。
+与其让它们空转,不如让每个线程在写进 shared <em>之前</em>先读两个元素加起来——
+于是每个 block 覆盖 <code>2*BLOCK</code> 个元素,<mark>grid 直接减半,固定开销摊薄一倍</mark>:</p>
+
+<pre><code><span class="kw">int</span> base = blockIdx.x*(BLOCK*<span class="num">2</span>) + tid;
+<span class="kw">float</span> a = g_in[base];
+<span class="kw">float</span> b = g_in[base + BLOCK];             <span class="cm">// 两段都连续 → 仍合并访问</span>
+sdata[tid] = a + b;                       <span class="hi">// ✅ 加载即相加,省掉第一轮的一半空转</span>
+<span class="fn">__syncthreads</span>();
+<span class="cm">// …接 v2 的 sequential 循环…</span></code></pre>
+
+<p>这是从"块内归约"转向"<strong>每线程多干活</strong>"的第一步,也是下一刀 grid-stride 的引子。</p>
+
+<h2>5. v4 第二刀:warp shuffle —— 最后 32 个线程不走 shared</h2>
 
 <p>注意上面循环走到 <code>s ≤ 32</code> 时,只剩<strong>一个 warp</strong> 在干活。这时还在用 <code>__syncthreads()</code>
 和 shared memory,纯属浪费——<mark>同一 warp 内的线程本就是锁步执行的,可以直接交换寄存器</mark>。
@@ -139,10 +182,10 @@ A100 上用 <code>__shfl_down_sync</code>:</p>
 shared 只用 <code>BLOCK/32</code> 个槽,几乎无 bank conflict。<code>__reduce_add_sync</code>(sm_80 原生指令)还能把整 warp 求和压成一条指令。
 </div>
 
-<h2>5. 第三刀:grid-stride —— 一个线程先吞多个元素(最关键)</h2>
+<h2>6. v5 第三刀:grid-stride —— 一个线程先吞多个元素</h2>
 
-<p>前面每个线程只读 1 个元素。但<strong>启动 block、加载、做 log₂ 轮归约</strong>这些<em>开销</em>是固定的,
-摊在 1 个元素上太亏。真正的提速来自<mark>让每个线程在进 shared 之前,先用一个 grid-stride 循环把 N/总线程数 个元素加起来</mark>:</p>
+<p>前面每个线程只读 1~2 个元素。但<strong>启动 block、加载、做 log₂ 轮归约</strong>这些<em>开销</em>是固定的,
+摊在 1 个元素上太亏。更进一步是<mark>让每个线程在进 shared 之前,先用一个 grid-stride 循环把 N/总线程数 个元素加起来</mark>:</p>
 
 <pre><code><span class="kw">int</span> i = blockIdx.x*BLOCK + tid;
 <span class="kw">int</span> stride = gridDim.x * BLOCK;          <span class="cm">// 整个 grid 的线程数</span>
@@ -153,18 +196,25 @@ shared 只用 <code>BLOCK/32</code> 个槽,几乎无 bank conflict。<code>__red
 }
 sdata[tid] = sum;                         <span class="cm">// 进 shared 时已经是局部和</span>
 <span class="fn">__syncthreads</span>();
-<span class="cm">// …接第 3、4 节的块内归约…</span></code></pre>
+<span class="cm">// …接 v2/v4 的块内归约 + warp shuffle 收尾…</span></code></pre>
 
 <p>为什么是 grid-stride 而不是"每个线程连读一段连续区间"?因为<strong>同一拍里 warp 的 32 个线程地址必须相邻才<a href="0003-memory-coalescing.html">合并</a></strong>。
 跳 <code>stride = gridDim.x*BLOCK</code> 保证每一轮 32 个线程读的是连续的 32 个 float。<span class="cite">[3]</span></p>
 
 <div class="keypt">
-<strong>这一刀决定成败。</strong> 它把"固定开销 / 元素"摊薄,同时让访存全程保持合并、规模随 N 自适应。
-<mark>block 数选 SM 数的若干倍(A100 有 108 个 SM,常取 几百~上千 个 block),</mark>每个线程吞几十~几百个元素,
-就能把 DRAM 带宽吃到 80–90%。这是从"能跑"到"接近极限"的关键。
+<strong>grid-stride 的真正价值是"grid 与 N 解耦"。</strong> 它把 block 数从百万级(每线程 1 元素)压到几百,
+<mark>block 数选 SM 数的若干倍(A100 108 SM → 几百~上千),</mark>每个线程吞几十~几百个元素,
+规模随 N 自适应,固定开销被彻底摊薄。
 </div>
 
-<h2>6. 收尾:两个标量怎么变一个</h2>
+<div class="keypt" style="background:#fbeeee;border-left:3px solid #7a2d2d">
+<strong>⚠️ 实测警告(别迷信"最关键一刀"):</strong> grid-stride 的<em>性能</em>领先,只在<strong>带宽墙高</strong>的卡上才看得出来。
+本机 3060 Laptop(~330 GB/s)上 <code>v4</code> 就已吃满带宽(~310 GB/s),<code>v5</code> 与之<strong>打平甚至略慢</strong>(~0.9x)——
+因为带宽已是天花板,grid 大小不再是瓶颈。到了 A100(~1.8 TB/s)带宽墙高得多,grid-stride 摊薄开销的收益才显现。
+<mark>所以"哪一刀最关键"是<strong>看卡</strong>的,不是绝对的</mark>。这正是第 7 节脊点直觉的延续:同一 kernel 在不同卡上瓶颈不同。
+</div>
+
+<h2>7. 收尾:G 个部分和怎么变一个标量</h2>
 
 <p>每个 block 产出一个部分和,grid 有 <code>G</code> 个 block → 得到 <code>G</code> 个部分和。怎么合成最终一个标量?三种路子:</p>
 
@@ -178,20 +228,40 @@ sdata[tid] = sum;                         <span class="cm">// 进 shared 时已�
 <p>A100 上 grid-stride 已经把 G 压得很小(几百~上千),所以 <code>atomicAdd</code> 收尾或两趟 kernel 都很快,差别可忽略——
 <mark>瓶颈始终是第一趟那次"完整读一遍数组",收尾只是零头。</mark></p>
 
-<h2>7. 真机验证:用 ncu 看 DRAM Throughput</h2>
+<h2>8. 真机验证:实测带宽 + ncu 看 DRAM Throughput</h2>
 
-<p>reduction 不看 Compute%,要盯<strong>内存吞吐</strong>。编译跑 profile(A100 用 <code>sm_80</code>):</p>
+<p>reduction 不看 Compute%,要盯<strong>内存吞吐</strong>。配套代码 <code>code/0008-reduce.cu</code> 把六版串成一个程序,
+用 CUDA event 计时逐版打印带宽与加速比。先看本机 <strong>3060 Laptop(sm_86,~330 GB/s 峰值)</strong>的实测:</p>
 
-<pre><code>nvcc -O3 -arch=sm_80 reduce.cu -o reduce
-ncu --set full --section MemoryWorkloadAnalysis ./reduce</code></pre>
+<pre><code>nvcc -O3 -arch=sm_86 0008-reduce.cu -o reduce   <span class="cm"># 3060;A100 用 -arch=sm_80</span>
+./reduce</code></pre>
+
+<table>
+<tr><th>版本</th><th>耗时(ms)</th><th>带宽(GB/s)</th><th>相对上一版</th></tr>
+<tr><td><code>v0</code> interleaved+modulo</td><td>10.9</td><td>98</td><td>—</td></tr>
+<tr><td><code>v1</code> 去发散</td><td>9.7</td><td>110</td><td>1.10x</td></tr>
+<tr><td><code>v2</code> sequential addr</td><td>9.7</td><td>111</td><td>1.22x</td></tr>
+<tr><td><code>v3</code> first-add-on-load</td><td>5.4</td><td>199</td><td>1.71x</td></tr>
+<tr><td><code>v4</code> warp shuffle</td><td><strong>3.5</strong></td><td><strong>310</strong></td><td>1.60x</td></tr>
+<tr><td><code>v5</code> grid-stride</td><td>3.7</td><td>286</td><td><mark>0.92x</mark></td></tr>
+</table>
+
+<p>读这张表的三个要点:<strong>(1)</strong> <code>v3</code>/<code>v4</code> 各贡献最大的两跳——加载即相加摊薄开销、warp shuffle 省掉最后 5 轮同步;
+<strong>(2)</strong> <code>v4</code> 已到 ~310 GB/s ≈ 峰值 <strong>92%</strong>,撞上 3060 的带宽墙;
+<strong>(3)</strong> <code>v5</code> grid-stride 反而略慢(0.92x)——不是写错了,而是带宽已封顶,grid 大小不再是瓶颈。
+<mark>同一条代码阶梯换到 A100,v5 才会反超</mark>。</p>
+
+<p>原生 Linux 上还可以用 <code>ncu</code> 看更细的读数(<strong>WSL 下 ncu 内核级 profiling 不可用</strong>,只能用上面的 event 计时):</p>
+
+<pre><code>ncu --set full --section MemoryWorkloadAnalysis ./reduce</code></pre>
 
 <p>三个关键读数,按这个顺序判断:</p>
 
 <table>
-<tr><th>指标</th><th>看什么</th><th>健康值(A100)</th></tr>
+<tr><th>指标</th><th>看什么</th><th>健康值</th></tr>
 <tr><td><code>DRAM Throughput</code></td><td>占峰值带宽的百分比 = 你离极限多远</td><td>✅ 优化后应 ≥ 80%</td></tr>
 <tr><td><code>Memory Throughput</code> / SOL</td><td><a href="0002-reading-speed-of-light.html">Speed of Light</a> 里 Memory 那条</td><td>✅ 高且 Compute 低 = 对了</td></tr>
-<tr><td><code>Bank Conflicts</code></td><td>shared 内冲突数</td><td>✅ 应为 0(第 3 节已治)</td></tr>
+<tr><td><code>Bank Conflicts</code></td><td>shared 内冲突数</td><td>✅ v2 起应为 0(第 3 节已治)</td></tr>
 </table>
 
 <div class="keypt">
@@ -200,18 +270,21 @@ ncu --set full --section MemoryWorkloadAnalysis ./reduce</code></pre>
 再快不会来自 reduction 本身,而是融合(把 reduction 和上游算子合成一个 kernel,省掉中间结果的读写)。
 </div>
 
-<h2>8. 整条优化链回顾</h2>
+<h2>9. 整条优化链回顾</h2>
 
 <table>
-<tr><th>阶段</th><th>动作</th><th>治的病 / 用的前节知识</th></tr>
+<tr><th>版本</th><th>动作</th><th>治的病 / 用的前节知识</th></tr>
 <tr><td>定位</td><td>算术强度 0.25 → 访存瓶颈</td><td>Roofline(L1)</td></tr>
-<tr><td>第一刀</td><td>sequential addressing</td><td>分支发散(L6)+ bank conflict(L5)</td></tr>
-<tr><td>第二刀</td><td>warp shuffle 收尾</td><td>省 shared 往返与 sync</td></tr>
-<tr><td>第三刀</td><td>grid-stride 多元素</td><td>合并访问(L3)+ 摊薄开销</td></tr>
-<tr><td>验证</td><td>ncu 看 DRAM Throughput ≥80%</td><td>读 SOL 报告(L2)</td></tr>
+<tr><td><code>v0</code></td><td>interleaved + 取模</td><td>baseline:发散 + bank conflict</td></tr>
+<tr><td><code>v1</code></td><td>去取模</td><td>分支发散(L6)</td></tr>
+<tr><td><code>v2</code></td><td>sequential addressing</td><td>bank conflict(L5)+ 残余发散,一刀治</td></tr>
+<tr><td><code>v3</code></td><td>first-add-on-load</td><td>消首轮空转,grid 减半</td></tr>
+<tr><td><code>v4</code></td><td>warp shuffle 收尾</td><td>省 shared 往返与 sync</td></tr>
+<tr><td><code>v5</code></td><td>grid-stride 多元素</td><td>合并访问(L3)+ grid 与 N 解耦(带宽墙高的卡才显收益)</td></tr>
+<tr><td>验证</td><td>event 计时 / ncu DRAM Throughput ≥80%</td><td>读 SOL 报告(L2)</td></tr>
 </table>
 
-<h2>9. 练习:reduction 决策(混合前几节)</h2>
+<h2>10. 练习:reduction 决策(混合前几节)</h2>
 <p>点选项看反馈。这些题交错了 roofline、合并、bank conflict、occupancy——这正是检验你是否真懂的方式。</p>
 <div id="quiz"></div>
 
@@ -262,7 +335,10 @@ const Q=[
   e:"访存瓶颈算子吃满带宽就是终点。再快只能靠融合(把 reduction 与上游算子合成一个 kernel)。"},
  {q:"第一趟得到 G 个 block 部分和。A100 grid-stride 下 G 很小,收尾用 atomicAdd 还是两趟 kernel?",
   a:["必须两趟否则错","只能atomicAdd","两者都行差别可忽略","得用cooperative grid"],c:2,
-  e:"瓶颈是第一趟完整读一遍数组,收尾只是零头。G 小的时候 atomicAdd 或两趟 kernel 性能几乎一样。"}
+  e:"瓶颈是第一趟完整读一遍数组,收尾只是零头。G 小的时候 atomicAdd 或两趟 kernel 性能几乎一样。"},
+ {q:"3060 上实测:v4(warp shuffle)已到 310 GB/s,v5(grid-stride)反而 0.92x 略慢。为什么?",
+  a:["v5代码写错了","v4已撞带宽墙,grid大小不再是瓶颈","grid-stride在任何卡都更慢","occupancy掉了"],c:1,
+  e:"3060 峰值仅 ~330 GB/s,v4 已吃满 92%。带宽封顶后,grid-stride 摊薄开销的收益无处体现 → 与大 grid 打平。换到带宽墙高的 A100,v5 才反超。哪一刀最关键是看卡的。"}
 ];
 const box=document.getElementById('quiz');
 Q.forEach((item,i)=>{

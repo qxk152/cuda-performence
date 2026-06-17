@@ -41,8 +41,11 @@
 - **环境升级(2025-06-13)**:从「本地无工具链、纸面学」→「双卡均可交互式跑命令,真机实操」。
   - `ncu` 在 3060 上已确认可用(2022.2)。消费卡跑 ncu 常需 **sudo 或开 perf counter 权限**,若报权限错有解法。
   - **更正(2026-06-14)**:3060 在 WSL 下,ncu 内核 profiling 实测**完全不可用**(见上"待确认"已落实)。3060 验证靠 event 计时 + 手算带宽。
-- 第 8 节(reduction)已实操:`code/0008-reduce.cu` 三版对照(textbook / naive / optim),3060 sm_86 实测
-  优化版 ~309 GB/s ≈ 峰值 92%;naive/optim 打平(带宽墙),book 慢 3.34x(暴露 grid-stride 才是大头)。
+- 第 8 节(reduction)已实操:`code/0008-reduce.cu` 按文章(Mark Harris reduce0→7)重写为**六版调优阶梯**
+  (v0 取模发散 → v1 去发散 → v2 顺序寻址 → v3 加载即相加 → v4 warp shuffle → v5 grid-stride),逐刀打印加速比。
+  3060 sm_86 实测(2026-06-17):v0 98 GB/s → v4 ~310 GB/s(≈峰值 92%),总加速 ~3.4x。
+  **关键观察**:v4→v5 grid-stride 在 3060 上只有 ~0.9x(持平/略慢),因为 v4 已撞带宽墙(~330 GB/s);
+  grid-stride 的真实价值是"grid 与 N 解耦 + 摊薄开销",其领先要在带宽墙高的 A100 上才看得出来。代码注释与 main 末尾已诚实标注此点。
 - 第 9 节(softmax/LayerNorm 融合)讲义已出:`lessons/0009-softmax-layernorm-fusion.html`。
   主线=减少 HBM 往返(未融合 6N → 融合 2N),online softmax + warp shuffle 归约二元组,串到 FlashAttention。
 - 下一节:attention 全链 / FlashAttention 分块思想(本节融合 softmax 是其核心积木)。
